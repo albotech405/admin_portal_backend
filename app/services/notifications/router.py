@@ -1,11 +1,15 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone
 from uuid import uuid4
+import logging
 
 from app.core.dependencies import require_admin
 from app.core.supabase import get_supabase
+from app.core.firebase import send_push_multicast, send_push_notification
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -68,6 +72,20 @@ class SendTargetedBody(BaseModel):
     schedule_at: Optional[str] = None
 
 
+class SendToUserBody(BaseModel):
+    user_id: str
+    title: str
+    body: str
+    notification_type: str = "admin_direct"
+    data: Optional[Dict[str, str]] = None  # extra key/value pairs sent via FCM
+
+
+class SendToUserResponse(BaseModel):
+    success: bool
+    push_delivered: bool
+    message: str
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────────
 
 
@@ -102,6 +120,26 @@ def send_notification(body: SendNotificationBody, _user=Depends(require_admin)):
 
         if len(user_ids) == 0:
             return SendNotificationResponse(success=True, recipient_count=0, message="No recipients found for the given target")
+
+        # Fetch FCM tokens for all recipients
+        token_result = (
+            sb.table("users")
+            .select("id, fcm_token")
+            .in_("id", user_ids)
+            .execute()
+        )
+        fcm_tokens = [
+            row["fcm_token"]
+            for row in (token_result.data or [])
+            if row.get("fcm_token")
+        ]
+
+        # Deliver via Firebase Cloud Messaging (best-effort)
+        if fcm_tokens and not body.schedule_at:
+            try:
+                send_push_multicast(fcm_tokens, body.title, body.body)
+            except Exception as fcm_err:
+                logger.warning("FCM multicast error: %s", fcm_err)
 
         # Build notification rows
         now = datetime.now(timezone.utc).isoformat()
@@ -228,6 +266,26 @@ def send_targeted_notification(body: SendTargetedBody, _user=Depends(require_adm
         if not user_ids:
             return SendNotificationResponse(success=True, recipient_count=0, message="No recipients matched filters")
 
+        # Fetch FCM tokens for all recipients
+        token_result = (
+            sb.table("users")
+            .select("id, fcm_token")
+            .in_("id", user_ids)
+            .execute()
+        )
+        fcm_tokens = [
+            row["fcm_token"]
+            for row in (token_result.data or [])
+            if row.get("fcm_token")
+        ]
+
+        # Deliver via Firebase Cloud Messaging (best-effort)
+        if fcm_tokens and not body.schedule_at:
+            try:
+                send_push_multicast(fcm_tokens, body.title, body.body)
+            except Exception as fcm_err:
+                logger.warning("FCM multicast error: %s", fcm_err)
+
         now = datetime.now(timezone.utc).isoformat()
         rows = [
             {
@@ -324,3 +382,68 @@ def get_notification_users(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch users: {str(e)}")
+
+
+@router.post("/admin/notifications/send-to-user", response_model=SendToUserResponse)
+def send_notification_to_user(body: SendToUserBody, _user=Depends(require_admin)):
+    """
+    Send a push notification directly to a single app user.
+    The notification is logged to the notifications table and, if the user
+    has an FCM token stored, immediately delivered to their device.
+    """
+    sb = get_supabase()
+    try:
+        # Fetch user and their FCM token
+        user_result = (
+            sb.table("users")
+            .select("id, full_name, fcm_token")
+            .eq("id", body.user_id)
+            .single()
+            .execute()
+        )
+        user_data = user_result.data
+        if not user_data:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        # Attempt FCM push delivery
+        fcm_token: Optional[str] = user_data.get("fcm_token")
+        push_delivered = False
+        if fcm_token:
+            push_delivered = send_push_notification(
+                token=fcm_token,
+                title=body.title,
+                body=body.body,
+                data=body.data,
+            )
+        else:
+            logger.info(
+                "User %s has no FCM token — notification logged only", body.user_id
+            )
+
+        # Log to notifications table regardless of push outcome
+        sb.table("notifications").insert(
+            {
+                "id": str(uuid4()),
+                "user_id": body.user_id,
+                "notification_type": body.notification_type,
+                "title": body.title,
+                "content": body.body,
+                "status": "sent",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "read_at": None,
+            }
+        ).execute()
+
+        return SendToUserResponse(
+            success=True,
+            push_delivered=push_delivered,
+            message=(
+                f"Notification sent to {user_data.get('full_name', body.user_id)}"
+                + (" and delivered via push" if push_delivered else " (no device token — in-app only)")
+            ),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send notification: {str(e)}")
