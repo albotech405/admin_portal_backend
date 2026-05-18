@@ -52,6 +52,12 @@ class DriverDetailResponse(DriverAdminListItem):
     documents: List[DriverDocumentResponse] = []
 
 
+class DriverProfileFullResponse(DriverDetailResponse):
+    """Full driver profile returned to both admin and driver-facing lookups.
+    Includes verification_feedback so drivers can see the exact rejection reason."""
+    verification_feedback: Optional[str] = None
+
+
 class DriverAdminListResponse(BaseModel):
     drivers: List[DriverAdminListItem]
     total: int
@@ -90,7 +96,44 @@ def list_drivers(
     return DriverAdminListResponse(drivers=drivers, total=len(drivers))
 
 
-@router.get("/{driver_id}", response_model=DriverDetailResponse)
+@router.get("/by-user/{user_id}", response_model=DriverProfileFullResponse)
+def get_driver_by_user(user_id: str, _user=Depends(require_admin)):
+    """Fetch a driver's full profile by their user_id (auth uid)."""
+    try:
+        sb = get_supabase()
+        result = (
+            sb.table("driver_profiles")
+            .select("*, users(full_name, phone_number), vehicle_details(*), driver_documents(*)")
+            .eq("user_id", user_id)
+            .maybe_single()
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Driver profile not found for this user")
+
+    row = result.data
+    user_info = row.pop("users", {}) or {}
+    vehicle_data = row.pop("vehicle_details", None)
+    if isinstance(vehicle_data, list):
+        vehicle_data = vehicle_data[0] if vehicle_data else None
+    documents = row.pop("driver_documents", []) or []
+    base_fields = {k: v for k, v in row.items() if k in _DRIVER_FIELDS and k != "verification_feedback"}
+
+    return DriverProfileFullResponse(
+        **base_fields,
+        verification_feedback=row.get("verification_feedback"),
+        full_name=user_info.get("full_name"),
+        phone_number=user_info.get("phone_number"),
+        total_trips=row.get("total_rides", 0) or 0,
+        vehicle=VehicleDetailsResponse(**vehicle_data) if vehicle_data else None,
+        documents=[DriverDocumentResponse(**doc) for doc in documents],
+    )
+
+
+@router.get("/{driver_id}", response_model=DriverProfileFullResponse)
 def get_driver_detail(driver_id: str, _user=Depends(require_admin)):
     try:
         sb = get_supabase()
@@ -113,10 +156,11 @@ def get_driver_detail(driver_id: str, _user=Depends(require_admin)):
     if isinstance(vehicle_data, list):
         vehicle_data = vehicle_data[0] if vehicle_data else None
     documents = row.pop("driver_documents", []) or []
-    row_fields = {k: v for k, v in row.items() if k in _DRIVER_FIELDS}
+    base_fields = {k: v for k, v in row.items() if k in _DRIVER_FIELDS and k != "verification_feedback"}
 
-    return DriverDetailResponse(
-        **row_fields,
+    return DriverProfileFullResponse(
+        **base_fields,
+        verification_feedback=row.get("verification_feedback"),
         full_name=user_info.get("full_name"),
         phone_number=user_info.get("phone_number"),
         total_trips=row.get("total_rides", 0) or 0,

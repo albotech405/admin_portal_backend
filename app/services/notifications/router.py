@@ -77,6 +77,7 @@ class SendToUserBody(BaseModel):
     title: str
     body: str
     notification_type: str = "admin_direct"
+    fcm_token: Optional[str] = None  # override the DB-stored token if provided
     data: Optional[Dict[str, str]] = None  # extra key/value pairs sent via FCM
 
 
@@ -405,8 +406,8 @@ def send_notification_to_user(body: SendToUserBody, _user=Depends(require_admin)
         if not user_data:
             raise HTTPException(status_code=404, detail="User not found")
 
-        # Attempt FCM push delivery
-        fcm_token: Optional[str] = user_data.get("fcm_token")
+        # Attempt FCM push delivery — prefer caller-supplied token over DB value
+        fcm_token: Optional[str] = body.fcm_token or user_data.get("fcm_token")
         push_delivered = False
         if fcm_token:
             push_delivered = send_push_notification(

@@ -18,7 +18,34 @@ from app.services.sos.router import router as sos_router
 from app.services.support.router import router as support_router
 from app.services.admin_mgmt.router import router as admin_mgmt_router
 
-app = FastAPI(title=settings.APP_NAME, version="1.0.0")
+app = FastAPI(
+    title=settings.APP_NAME,
+    version="1.0.0",
+)
+
+# Enhance the auto-generated HTTPBearer security scheme with a description
+from fastapi.openapi.utils import get_openapi
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        routes=app.routes,
+    )
+    schemes = schema.setdefault("components", {}).setdefault("securitySchemes", {})
+    # FastAPI names the scheme "HTTPBearer" from the HTTPBearer dependency
+    schemes.setdefault("HTTPBearer", {}).update({
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Paste your Supabase JWT access token (without 'Bearer ' prefix)",
+    })
+    app.openapi_schema = schema
+    return schema
+
+app.openapi = custom_openapi
 
 app.add_middleware(
     CORSMiddleware,
