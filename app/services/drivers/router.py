@@ -248,20 +248,17 @@ def suspend_driver(driver_id: str, body: SuspendDriverBody, _user=Depends(requir
     if not admin_id:
         raise HTTPException(status_code=400, detail="Admin token must include a user id")
     try:
-        sb = get_supabase()
-        sb.table("driver_profiles").update({
-            "verification_status": "suspended",
-            "is_suspended": True,
-            "verification_feedback": body.reason,
-        }).eq("id", driver_id).execute()
-        result = sb.table("driver_profiles").select(
-            "*, users(full_name, phone_number)"
-        ).eq("id", driver_id).maybe_single().execute()
+        result = first_row(
+            call_rpc(
+                "reject_driver",
+                {"p_driver_id": driver_id, "p_reason": body.reason, "p_admin_id": admin_id},
+            )
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    if not result.data:
+    if not result:
         raise HTTPException(status_code=404, detail="Driver not found")
-    return result.data
+    return result
 
 
 @router.patch("/{driver_id}/unsuspend")
@@ -270,20 +267,34 @@ def unsuspend_driver(driver_id: str, _user=Depends(require_admin)):
     if not admin_id:
         raise HTTPException(status_code=400, detail="Admin token must include a user id")
     try:
-        sb = get_supabase()
-        sb.table("driver_profiles").update({
-            "verification_status": "approved",
-            "is_suspended": False,
-            "verification_feedback": None,
-        }).eq("id", driver_id).execute()
-        result = sb.table("driver_profiles").select(
-            "*, users(full_name, phone_number)"
-        ).eq("id", driver_id).maybe_single().execute()
+        result = first_row(
+            call_rpc("approve_driver", {"p_driver_id": driver_id, "p_admin_id": admin_id})
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    if not result.data:
+    if not result:
         raise HTTPException(status_code=404, detail="Driver not found")
-    return result.data
+    return result
+
+
+@router.patch("/{driver_id}/block")
+def block_driver(driver_id: str, _user=Depends(require_admin)):
+    """Block driver if wallet balance is zero or negative (calls block_driver_if_no_balance RPC)."""
+    admin_id = _user.get("id")
+    if not admin_id:
+        raise HTTPException(status_code=400, detail="Admin token must include a user id")
+    try:
+        result = first_row(
+            call_rpc(
+                "block_driver_if_no_balance",
+                {"p_driver_id": driver_id, "p_admin_id": admin_id},
+            )
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not result:
+        raise HTTPException(status_code=404, detail="Driver not found")
+    return result
 
 
 class CategoryUpdateBody(BaseModel):
@@ -303,6 +314,48 @@ def update_driver_category(driver_id: str, body: CategoryUpdateBody, _user=Depen
     if not result.data:
         raise HTTPException(status_code=404, detail="Driver not found")
     return result.data
+
+
+class DocumentRejectBody(BaseModel):
+    reason: str
+
+
+@router.patch("/{driver_id}/documents/{document_id}/approve")
+def approve_driver_document(driver_id: str, document_id: str, _user=Depends(require_admin)):
+    """Approve an individual driver document."""
+    try:
+        sb = get_supabase()
+        result = (
+            sb.table("driver_documents")
+            .update({"status": "approved"})
+            .eq("id", document_id)
+            .eq("driver_id", driver_id)
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return {"message": "Document approved", "document_id": document_id}
+
+
+@router.patch("/{driver_id}/documents/{document_id}/reject")
+def reject_driver_document(driver_id: str, document_id: str, body: DocumentRejectBody, _user=Depends(require_admin)):
+    """Reject an individual driver document with a reason."""
+    try:
+        sb = get_supabase()
+        result = (
+            sb.table("driver_documents")
+            .update({"status": "rejected", "rejection_reason": body.reason})
+            .eq("id", document_id)
+            .eq("driver_id", driver_id)
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return {"message": "Document rejected", "document_id": document_id, "reason": body.reason}
 
 
 @router.delete("/{driver_id}")

@@ -36,6 +36,7 @@ class TransactionListResponse(BaseModel):
 
 
 @router.get("/admin/transactions", response_model=TransactionListResponse)
+@router.get("/admin/list", response_model=TransactionListResponse, include_in_schema=False)
 def list_transactions(
     status: Optional[str] = Query(None, description="Filter by status (completed, cancelled, etc.)"),
     method: Optional[str] = Query(None, description="Filter by payment method (cash, Orange Money, M-Pesa, Airtel Money)"),

@@ -314,3 +314,19 @@ def escalate_dispute(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Secondary router: /disputes prefix (alias for frontend convenience) ──
+
+disputes_router = APIRouter(prefix="/disputes", tags=["disputes"])
+
+
+@disputes_router.get("/admin/list", response_model=DisputeListResponse, include_in_schema=False)
+def list_disputes_alt(status: Optional[str] = None, _user=Depends(require_admin)):
+    """Alias for /rides/admin/disputes."""
+    try:
+        sb = get_supabase()
+        items = _fetch_dispute_rides(sb, status_filter=status)
+        return DisputeListResponse(disputes=items, total=len(items))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

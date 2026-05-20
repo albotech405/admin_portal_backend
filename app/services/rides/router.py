@@ -882,3 +882,23 @@ def get_marketplace_view(
         total_active=len(requests_list),
         stale_count=stale_count,
     )
+
+
+@router.post("/{ride_id}/deduct-commission")
+def deduct_commission(ride_id: str, _user=Depends(require_admin)):
+    """
+    Manually trigger commission deduction for a completed ride.
+    Normally this is called automatically via the database trigger when a ride
+    transitions to 'completed'. Use this endpoint if the automatic trigger failed
+    or to retry a failed deduction.
+    """
+    from app.core.supabase import call_rpc, first_row
+    try:
+        result = first_row(
+            call_rpc("deduct_commission", {"p_ride_id": ride_id})
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not result:
+        raise HTTPException(status_code=404, detail="Ride not found or commission not applicable")
+    return result

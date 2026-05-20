@@ -47,6 +47,7 @@ class DriverLocationsResponse(BaseModel):
 
 
 @router.get("/admin/dashboard", response_model=DashboardMetricsResponse)
+@router.get("/admin/overview", response_model=DashboardMetricsResponse, include_in_schema=False)
 def get_dashboard_metrics(_user=Depends(require_admin)):
     try:
         sb = get_supabase()
