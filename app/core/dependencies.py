@@ -1,5 +1,6 @@
 from typing import Optional, List
 import logging
+import httpx
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
@@ -17,20 +18,27 @@ def _verify_token(token: str) -> dict:
     """
     Verify a bearer token.
 
-    1. Try Supabase auth API — works for ES256 user JWTs (the format Supabase now issues).
+    1. Call Supabase /auth/v1/user directly (handles ES256 user JWTs, no client state mutation).
     2. Fall back to local HS256 decode for service_role tokens signed internally.
     """
-    # --- Primary: ask Supabase to validate the token ---
+    # --- Primary: direct HTTP call to Supabase auth API ---
     try:
-        sb = get_supabase()
-        resp = sb.auth.get_user(token)
-        if resp and resp.user:
-            return {"id": resp.user.id, "role": "authenticated"}
-        logger.warning("auth.get_user returned no user for token")
+        resp = httpx.get(
+            f"{settings.SUPABASE_URL}/auth/v1/user",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "apikey": settings.SUPABASE_KEY,
+            },
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return {"id": data["id"], "role": "authenticated"}
+        logger.warning("Supabase /auth/v1/user returned %s: %s", resp.status_code, resp.text[:200])
     except Exception as exc:
-        logger.warning("auth.get_user failed: %s", exc)
+        logger.warning("Supabase auth HTTP call failed: %s", exc)
 
-    # --- Fallback: local decode for HS256 service_role tokens ---
+    # --- Fallback: local HS256 decode for service_role tokens ---
     try:
         payload = jwt.decode(
             token,
