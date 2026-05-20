@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -17,12 +17,22 @@ router = APIRouter()
 
 
 class SendNotificationBody(BaseModel):
-    target: str  # "all_users" | "all_drivers" | "all_customers" | "specific"
+    # target: "all" | "all_users" | "all_drivers" | "all_customers" | "specific"
+    target: str
     user_ids: Optional[List[str]] = None  # required when target = "specific"
     title: str
-    body: str
-    notification_type: str = "admin_broadcast"
-    schedule_at: Optional[str] = None  # ISO datetime string for future send
+    body: Optional[str] = None        # legacy field name
+    message: Optional[str] = None     # frontend field name (alias for body)
+    notification_type: str = "system"
+    schedule_at: Optional[str] = None
+
+    @model_validator(mode="after")
+    def resolve_message(self):
+        if not self.body and self.message:
+            self.body = self.message
+        if not self.body:
+            raise ValueError("Either 'body' or 'message' must be provided")
+        return self
 
 
 class NotificationHistoryItem(BaseModel):
@@ -62,21 +72,35 @@ class SendNotificationResponse(BaseModel):
     message: str
 
 
+class BroadcastResult(BaseModel):
+    sent: int
+    failed: int
+
+
 class SendTargetedBody(BaseModel):
     title: str
-    body: str
-    notification_type: str = "admin_targeted"
+    body: Optional[str] = None        # legacy field name
+    message: Optional[str] = None     # frontend field name (alias for body)
+    notification_type: str = "system"  # targeted
     role: Optional[str] = None          # "driver" | "customer" | None = all
     is_active: Optional[bool] = None    # True = active only
     user_ids: Optional[List[str]] = None  # explicit list overrides filters
     schedule_at: Optional[str] = None
+
+    @model_validator(mode="after")
+    def resolve_message(self):
+        if not self.body and self.message:
+            self.body = self.message
+        if not self.body:
+            raise ValueError("Either 'body' or 'message' must be provided")
+        return self
 
 
 class SendToUserBody(BaseModel):
     user_id: str
     title: str
     body: str
-    notification_type: str = "admin_direct"
+    notification_type: str = "system"  # direct
     fcm_token: Optional[str] = None  # override the DB-stored token if provided
     data: Optional[Dict[str, str]] = None  # extra key/value pairs sent via FCM
 
@@ -90,84 +114,86 @@ class SendToUserResponse(BaseModel):
 # ── Endpoints ──────────────────────────────────────────────────────────────
 
 
-@router.post("/admin/notifications/send", response_model=SendNotificationResponse)
+@router.post("/admin/notifications/send", response_model=BroadcastResult)
 def send_notification(body: SendNotificationBody, _user=Depends(require_admin)):
-    """Send a notification to a target audience or specific users."""
+    """Broadcast a notification to a target audience or specific users."""
     sb = get_supabase()
 
-    # Resolve recipient user IDs based on target
     user_ids: List[str] = []
 
     try:
-        if body.target == "specific":
-            if not body.user_ids or len(body.user_ids) == 0:
-                raise HTTPException(status_code=400, detail="user_ids required when target=specific")
-            user_ids = body.user_ids
-
-        elif body.target == "all_users":
+        if body.target in ("all", "all_users"):
             result = sb.table("users").select("id").eq("is_active", True).execute()
             user_ids = [row["id"] for row in (result.data or [])]
 
         elif body.target == "all_drivers":
-            result = sb.table("users").select("id").eq("role", "driver").eq("is_active", True).execute()
+            result = (
+                sb.table("users").select("id")
+                .eq("role", "driver").eq("is_active", True).execute()
+            )
             user_ids = [row["id"] for row in (result.data or [])]
 
         elif body.target == "all_customers":
-            result = sb.table("users").select("id").eq("role", "customer").eq("is_active", True).execute()
+            result = (
+                sb.table("users").select("id")
+                .eq("role", "customer").eq("is_active", True).execute()
+            )
             user_ids = [row["id"] for row in (result.data or [])]
+
+        elif body.target == "specific":
+            if not body.user_ids:
+                raise HTTPException(status_code=400, detail="user_ids required when target=specific")
+            user_ids = body.user_ids
 
         else:
             raise HTTPException(status_code=400, detail=f"Unknown target: {body.target}")
 
-        if len(user_ids) == 0:
-            return SendNotificationResponse(success=True, recipient_count=0, message="No recipients found for the given target")
+        if not user_ids:
+            return BroadcastResult(sent=0, failed=0)
 
-        # Fetch FCM tokens for all recipients
+        # Fetch FCM tokens
         token_result = (
-            sb.table("users")
-            .select("id, fcm_token")
-            .in_("id", user_ids)
-            .execute()
+            sb.table("users").select("id, fcm_token")
+            .in_("id", user_ids).execute()
         )
-        fcm_tokens = [
-            row["fcm_token"]
+        token_map = {
+            row["id"]: row["fcm_token"]
             for row in (token_result.data or [])
             if row.get("fcm_token")
-        ]
+        }
+        fcm_tokens = list(token_map.values())
+        no_token_count = len(user_ids) - len(fcm_tokens)
 
-        # Deliver via Firebase Cloud Messaging (best-effort)
+        fcm_sent = 0
+        fcm_failed = no_token_count  # users with no token count as not delivered
         if fcm_tokens and not body.schedule_at:
             try:
-                send_push_multicast(fcm_tokens, body.title, body.body)
+                counts = send_push_multicast(fcm_tokens, body.title, body.body)
+                fcm_sent = counts.get("success", 0)
+                fcm_failed += counts.get("failure", 0)
             except Exception as fcm_err:
                 logger.warning("FCM multicast error: %s", fcm_err)
+                fcm_failed += len(fcm_tokens)
 
-        # Build notification rows
+        # Persist to DB
         now = datetime.now(timezone.utc).isoformat()
-        rows = []
-        for uid in user_ids:
-            rows.append({
+        rows = [
+            {
                 "id": str(uuid4()),
                 "user_id": uid,
                 "notification_type": body.notification_type,
                 "title": body.title,
                 "content": body.body,
-                "status": "scheduled" if body.schedule_at else "sent",
+                "status": "unread",
                 "created_at": now,
-                "read_at": None,
-            })
-
-        # Batch insert (chunked to avoid payload limits)
+            }
+            for uid in user_ids
+        ]
         chunk_size = 100
         for i in range(0, len(rows), chunk_size):
-            chunk = rows[i : i + chunk_size]
-            sb.table("notifications").insert(chunk).execute()
+            sb.table("notifications").insert(rows[i : i + chunk_size]).execute()
 
-        return SendNotificationResponse(
-            success=True,
-            recipient_count=len(user_ids),
-            message=f"Notification sent to {len(user_ids)} recipient(s)",
-        )
+        return BroadcastResult(sent=fcm_sent, failed=fcm_failed)
 
     except HTTPException:
         raise
@@ -246,7 +272,7 @@ def get_notification_history(
         raise HTTPException(status_code=500, detail=f"Failed to fetch notification history: {str(e)}")
 
 
-@router.post("/admin/notifications/send-targeted", response_model=SendNotificationResponse)
+@router.post("/admin/notifications/send-targeted", response_model=BroadcastResult)
 def send_targeted_notification(body: SendTargetedBody, _user=Depends(require_admin)):
     """Send to an explicit user list or a filtered segment (role + active status)."""
     sb = get_supabase()
@@ -265,27 +291,30 @@ def send_targeted_notification(body: SendTargetedBody, _user=Depends(require_adm
             user_ids = [r["id"] for r in (result.data or [])]
 
         if not user_ids:
-            return SendNotificationResponse(success=True, recipient_count=0, message="No recipients matched filters")
+            return BroadcastResult(sent=0, failed=0)
 
-        # Fetch FCM tokens for all recipients
+        # Fetch FCM tokens
         token_result = (
-            sb.table("users")
-            .select("id, fcm_token")
-            .in_("id", user_ids)
-            .execute()
+            sb.table("users").select("id, fcm_token")
+            .in_("id", user_ids).execute()
         )
         fcm_tokens = [
             row["fcm_token"]
             for row in (token_result.data or [])
             if row.get("fcm_token")
         ]
+        no_token_count = len(user_ids) - len(fcm_tokens)
 
-        # Deliver via Firebase Cloud Messaging (best-effort)
+        fcm_sent = 0
+        fcm_failed = no_token_count
         if fcm_tokens and not body.schedule_at:
             try:
-                send_push_multicast(fcm_tokens, body.title, body.body)
+                counts = send_push_multicast(fcm_tokens, body.title, body.body)
+                fcm_sent = counts.get("success", 0)
+                fcm_failed += counts.get("failure", 0)
             except Exception as fcm_err:
                 logger.warning("FCM multicast error: %s", fcm_err)
+                fcm_failed += len(fcm_tokens)
 
         now = datetime.now(timezone.utc).isoformat()
         rows = [
@@ -295,21 +324,16 @@ def send_targeted_notification(body: SendTargetedBody, _user=Depends(require_adm
                 "notification_type": body.notification_type,
                 "title": body.title,
                 "content": body.body,
-                "status": "scheduled" if body.schedule_at else "sent",
+                "status": "unread",
                 "created_at": now,
             }
             for uid in user_ids
         ]
-
         chunk_size = 100
         for i in range(0, len(rows), chunk_size):
             sb.table("notifications").insert(rows[i : i + chunk_size]).execute()
 
-        return SendNotificationResponse(
-            success=True,
-            recipient_count=len(user_ids),
-            message=f"Targeted notification sent to {len(user_ids)} recipient(s)",
-        )
+        return BroadcastResult(sent=fcm_sent, failed=fcm_failed)
     except HTTPException:
         raise
     except Exception as e:
@@ -429,9 +453,8 @@ def send_notification_to_user(body: SendToUserBody, _user=Depends(require_admin)
                 "notification_type": body.notification_type,
                 "title": body.title,
                 "content": body.body,
-                "status": "sent",
+                "status": "unread",
                 "created_at": datetime.now(timezone.utc).isoformat(),
-                "read_at": None,
             }
         ).execute()
 
