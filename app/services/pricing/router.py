@@ -738,4 +738,8 @@ def get_pricing_audit_log(
         ]
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch pricing audit log: {str(e)}")
+        err_str = str(e)
+        # Table hasn't been created yet — return empty list gracefully
+        if "PGRST200" in err_str or "pricing_audit_log" in err_str:
+            return []
+        raise HTTPException(status_code=500, detail=f"Failed to fetch pricing audit log: {err_str}")
