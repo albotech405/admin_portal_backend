@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from typing import Optional, List
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from app.core.dependencies import require_admin
@@ -647,27 +647,40 @@ def get_pricing_metrics(
     try:
         categories = ["standard", "premium", "lady_driver"]
         metrics: List[CategoryMetricsItem] = []
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
         for category in categories:
-            # Count completed rides in this category
-            ride_result = sb.table("rides").select("id, accepted_price", count="exact").eq("category", category).eq("status", "completed").gte("created_at", f"now() - interval '{days} days'").execute()
-            ride_count = ride_result.count or 0
-            rides = ride_result.data or []
-            avg_fare = round(sum(float(r.get("accepted_price", 0) or 0) for r in rides) / ride_count, 2) if ride_count > 0 else None
+            ride_count = 0
+            avg_fare = None
+            active_drivers = 0
+            total_requests = 0
 
-            # Count active drivers for this category
-            if category == "standard":
-                # Standard includes ALL approved drivers
-                driver_result = sb.table("driver_profiles").select("id", count="exact").eq("verification_status", "approved").execute()
-            else:
-                driver_result = sb.table("driver_profiles").select("id", count="exact").eq("verification_status", "approved").eq("category", category).execute()
-            active_drivers = driver_result.count or 0
+            try:
+                # Count completed rides in this category
+                ride_result = sb.table("rides").select("id, price", count="exact").eq("category", category).eq("status", "completed").gte("created_at", cutoff).execute()
+                ride_count = ride_result.count or 0
+                rides = ride_result.data or []
+                avg_fare = round(sum(float(r.get("price", 0) or 0) for r in rides) / ride_count, 2) if ride_count > 0 else None
+            except Exception:
+                pass
 
-            # Count total ride requests in this category
-            request_result = sb.table("ride_requests").select("id", count="exact").eq("category", category).gte("created_at", f"now() - interval '{days} days'").execute()
-            total_requests = request_result.count or 0
+            try:
+                # Count active drivers for this category
+                if category == "standard":
+                    driver_result = sb.table("driver_profiles").select("id", count="exact").eq("verification_status", "approved").execute()
+                else:
+                    driver_result = sb.table("driver_profiles").select("id", count="exact").eq("verification_status", "approved").eq("category", category).execute()
+                active_drivers = driver_result.count or 0
+            except Exception:
+                pass
 
-            # Conversion rate
+            try:
+                # Count total ride requests in this category
+                request_result = sb.table("ride_requests").select("id", count="exact").eq("category", category).gte("created_at", cutoff).execute()
+                total_requests = request_result.count or 0
+            except Exception:
+                pass
+
             conversion_rate = round(ride_count / total_requests * 100, 1) if total_requests > 0 else None
 
             metrics.append(CategoryMetricsItem(

@@ -95,8 +95,16 @@ def _get_admin_profile(sb, user_id: str) -> dict:
     return result.data
 
 
+def _require_user_id(user: dict):
+    """Raise 403 if the token has no real user ID (e.g. service_role machine tokens)."""
+    if not user.get("id"):
+        raise HTTPException(status_code=403, detail="This endpoint requires a user-scoped token")
+
+
 def _require_super_admin(user: dict, sb):
     """Raise 403 if the calling admin is not super_admin."""
+    if user.get("role") == "service_role":
+        return  # service_role tokens have full access
     row = sb.table("users").select("admin_role").eq("id", user["id"]).maybe_single().execute()
     if not row.data or row.data.get("admin_role") != "super_admin":
         raise HTTPException(status_code=403, detail="Super admin access required")
@@ -106,6 +114,7 @@ def _require_super_admin(user: dict, sb):
 
 @router.get("/me", response_model=AdminUserItem)
 def get_my_profile(_user=Depends(require_admin)):
+    _require_user_id(_user)
     sb = get_supabase()
     data = _get_admin_profile(sb, _user["id"])
     return AdminUserItem(**{k: data[k] for k in AdminUserItem.model_fields if k in data})
@@ -114,6 +123,7 @@ def get_my_profile(_user=Depends(require_admin)):
 @router.post("/me/record-login")
 def record_admin_login(request: Request, _user=Depends(require_admin)):
     """Called by frontend immediately after successful auth to record login time + session."""
+    _require_user_id(_user)
     sb = get_supabase()
     now = datetime.now(timezone.utc).isoformat()
     ip = request.client.host if request.client else None
@@ -173,6 +183,7 @@ def record_admin_login(request: Request, _user=Depends(require_admin)):
 @router.post("/me/invalidate-session")
 def invalidate_session(session_id: str = Query(...), _user=Depends(require_admin)):
     """Mark a session as inactive (logout)."""
+    _require_user_id(_user)
     sb = get_supabase()
     try:
         sb.table("admin_sessions").update({"is_active": False}).eq("id", session_id).eq("admin_user_id", _user["id"]).execute()
@@ -186,6 +197,7 @@ def invalidate_session(session_id: str = Query(...), _user=Depends(require_admin
 @router.get("/me/2fa/status")
 def get_2fa_status(_user=Depends(require_admin)):
     """Return whether 2FA is currently enabled for this admin."""
+    _require_user_id(_user)
     sb = get_supabase()
     try:
         row = sb.table("users").select("two_fa_enabled").eq("id", _user["id"]).maybe_single().execute()
@@ -201,6 +213,7 @@ def enable_2fa(_user=Depends(require_admin)):
     Enable 2FA for this admin. Supabase Auth manages the actual TOTP secret via
     supabase.auth.mfa.enroll() on the frontend. This endpoint just marks the flag.
     """
+    _require_user_id(_user)
     sb = get_supabase()
     try:
         sb.table("users").update({"two_fa_enabled": True}).eq("id", _user["id"]).execute()
@@ -211,6 +224,7 @@ def enable_2fa(_user=Depends(require_admin)):
 
 @router.post("/me/2fa/disable")
 def disable_2fa(_user=Depends(require_admin)):
+    _require_user_id(_user)
     sb = get_supabase()
     try:
         sb.table("users").update({"two_fa_enabled": False}).eq("id", _user["id"]).execute()
@@ -415,6 +429,7 @@ def list_sessions(
 @router.get("/role")
 def get_my_role(_user=Depends(require_admin)):
     """Return current admin's role. Frontend calls this once after login."""
+    _require_user_id(_user)
     sb = get_supabase()
     try:
         row = sb.table("users").select("admin_role, full_name, email, two_fa_enabled").eq("id", _user["id"]).maybe_single().execute()

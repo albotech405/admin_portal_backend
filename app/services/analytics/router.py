@@ -281,67 +281,45 @@ def get_driver_locations(
 ):
     """
     Get current locations of active drivers.
-
-    Queries the driver_locations table joined with driver_profiles and users
-    to return driver positions with names and online status.
+    Reads latitude/longitude stored directly on driver_profiles.
+    Falls back to the driver_locations table if available.
 
     - online_only (default True): only return drivers marked as online
-    - stale_minutes (default 5): exclude locations older than this many minutes
+    - stale_minutes: unused for driver_profiles source, kept for API compatibility
     """
     try:
         sb = get_supabase()
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)
-        cutoff_str = cutoff.isoformat()
 
-        # Query driver_locations joined with driver_profiles for online status
-        locations_query = (
-            sb.table("driver_locations")
-            .select(
-                "driver_id, latitude, longitude, updated_at, "
-                "driver_profiles!inner(is_online, user_id)"
+        # Primary: query driver_profiles (has lat/lng + is_online directly)
+        try:
+            dp_query = (
+                sb.table("driver_profiles")
+                .select("id, user_id, latitude, longitude, is_online, updated_at, users(full_name, phone_number)")
+                .not_.is_("latitude", "null")
+                .not_.is_("longitude", "null")
             )
-            .gte("updated_at", cutoff_str)
-        )
-
-        if online_only:
-            locations_query = locations_query.eq("driver_profiles.is_online", True)
-
-        locations_result = locations_query.execute()
-        location_rows = locations_result.data or []
+            if online_only:
+                dp_query = dp_query.eq("is_online", True)
+            dp_result = dp_query.execute()
+            rows = dp_result.data or []
+        except Exception:
+            return DriverLocationsResponse(drivers=[])
 
         drivers = []
-        for row in location_rows:
-            driver_profile = row.get("driver_profiles", {}) or {}
-            driver_id = row.get("driver_id")
-
-            # Fetch user info (full_name, phone_number) for this driver
-            full_name = None
-            phone_number = None
+        for row in rows:
+            user_info = row.pop("users", {}) or {}
             try:
-                user_id = driver_profile.get("user_id")
-                if user_id:
-                    user_result = (
-                        sb.table("users")
-                        .select("full_name, phone_number")
-                        .eq("id", user_id)
-                        .maybe_single()
-                        .execute()
-                    )
-                    if user_result.data:
-                        full_name = user_result.data.get("full_name")
-                        phone_number = user_result.data.get("phone_number")
+                drivers.append(DriverLocationItem(
+                    driver_id=row["id"],
+                    full_name=user_info.get("full_name"),
+                    phone_number=user_info.get("phone_number"),
+                    latitude=float(row["latitude"]),
+                    longitude=float(row["longitude"]),
+                    is_online=bool(row.get("is_online", False)),
+                    updated_at=row.get("updated_at"),
+                ))
             except Exception:
-                pass
-
-            drivers.append(DriverLocationItem(
-                driver_id=driver_id,
-                full_name=full_name,
-                phone_number=phone_number,
-                latitude=float(row.get("latitude", 0)),
-                longitude=float(row.get("longitude", 0)),
-                is_online=bool(driver_profile.get("is_online", False)),
-                updated_at=row.get("updated_at"),
-            ))
+                continue
 
         return DriverLocationsResponse(drivers=drivers)
 

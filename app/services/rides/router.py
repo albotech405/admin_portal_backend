@@ -394,9 +394,7 @@ def get_active_ride_requests(
         sb = get_supabase()
         result = (
             sb.table("ride_requests")
-            .select(
-                "*, users!ride_requests_customer_id_fkey(full_name, phone_number)"
-            )
+            .select("*, users(full_name, phone_number)")
             .eq("status", "pending")
             .order("created_at", desc=True)
             .execute()
@@ -518,59 +516,56 @@ def list_active_trips(
     """
     try:
         sb = get_supabase()
+        # rides table has denormalized customer_name/driver_name/phone columns
         result = (
             sb.table("rides")
-            .select(
-                "*, "
-                "users!rides_customer_id_fkey(full_name, phone_number), "
-                "driver_profiles!rides_driver_id_fkey("
-                "  users!driver_profiles_user_id_fkey(full_name, phone_number), "
-                "  latitude, longitude"
-                ")"
-            )
-            .in_("status", ["started", "arrived", "in_progress"])
+            .select("*")
+            .in_("status", ["in_progress", "driver_en_route", "arrived"])
             .order("started_at", desc=True)
             .execute()
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    items = []
-    for r in result.data or []:
-        customer_info = r.pop("users", {}) or {}
-        driver_profile = r.pop("driver_profiles", None) or {}
-        driver_user_info = (
-            driver_profile.pop("users", {})
-            if isinstance(driver_profile, dict)
-            else {}
-        )
+    rides_data = result.data or []
 
+    # Fetch driver coordinates in one batch
+    driver_ids = list({r["driver_id"] for r in rides_data if r.get("driver_id")})
+    driver_coords: dict = {}
+    if driver_ids:
+        try:
+            coords_result = (
+                sb.table("driver_profiles")
+                .select("id, latitude, longitude")
+                .in_("id", driver_ids)
+                .execute()
+            )
+            for dp in coords_result.data or []:
+                driver_coords[dp["id"]] = dp
+        except Exception:
+            pass
+
+    items = []
+    for r in rides_data:
+        dp = driver_coords.get(r.get("driver_id") or "", {})
         items.append(ActiveTripItem(
             id=r.get("id"),
             ride_request_id=r.get("ride_request_id"),
             customer_id=r.get("customer_id"),
             driver_id=r.get("driver_id"),
-            customer_name=customer_info.get("full_name"),
-            customer_phone=customer_info.get("phone_number"),
-            driver_name=driver_user_info.get("full_name"),
-            driver_phone=driver_user_info.get("phone_number"),
+            customer_name=r.get("customer_name"),
+            customer_phone=r.get("customer_phone"),
+            driver_name=r.get("driver_name"),
+            driver_phone=r.get("driver_phone"),
             picking_point=r.get("picking_point"),
             destination=r.get("destination"),
-            price=float(r.get("price", 0)),
-            status=r.get("status", "started"),
+            price=float(r.get("price") or 0),
+            status=r.get("status", "in_progress"),
             started_at=r.get("started_at"),
             completed_at=r.get("completed_at"),
             created_at=r.get("created_at"),
-            driver_latitude=(
-                float(driver_profile["latitude"])
-                if isinstance(driver_profile, dict) and driver_profile.get("latitude")
-                else None
-            ),
-            driver_longitude=(
-                float(driver_profile["longitude"])
-                if isinstance(driver_profile, dict) and driver_profile.get("longitude")
-                else None
-            ),
+            driver_latitude=float(dp["latitude"]) if dp.get("latitude") else None,
+            driver_longitude=float(dp["longitude"]) if dp.get("longitude") else None,
             duration_minutes=r.get("duration_minutes"),
             distance_km=r.get("distance_km"),
         ))
@@ -793,9 +788,7 @@ def get_marketplace_view(
         sb = get_supabase()
         result = (
             sb.table("ride_requests")
-            .select(
-                "*, users!ride_requests_customer_id_fkey(full_name, phone_number)"
-            )
+            .select("*, users(full_name, phone_number)")
             .eq("status", "pending")
             .order("created_at", desc=True)
             .execute()

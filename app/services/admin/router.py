@@ -71,8 +71,11 @@ def list_admin_logs(
         if action:
             query = query.eq("action", action)
         result = query.order("created_at", desc=True).execute()
+        logs = [AdminLogEntry(**row) for row in (result.data or [])]
+        return AdminLogListResponse(logs=logs, total=len(logs))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    logs = [AdminLogEntry(**row) for row in (result.data or [])]
-    return AdminLogListResponse(logs=logs, total=len(logs))
+        err = str(e)
+        # Table may not exist yet if the SQL migration hasn't been applied
+        if "admin_logs" in err and ("PGRST205" in err or "schema cache" in err or "does not exist" in err):
+            return AdminLogListResponse(logs=[], total=0)
+        raise HTTPException(status_code=500, detail=err)
