@@ -1,6 +1,6 @@
 from typing import List
 from pathlib import Path
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Resolve .env relative to this file: backend/app/core/config.py -> backend/.env
@@ -18,6 +18,14 @@ class Settings(BaseSettings):
     SUPABASE_JWT_SECRET: str
     SUPABASE_SERVICE_KEY: str
     DATABASE_URL: str
+
+    @field_validator("SUPABASE_JWT_SECRET", mode="before")
+    @classmethod
+    def strip_jwt_secret_quotes(cls, v: str) -> str:
+        """Strip accidental surrounding quote characters (common Render env-var mistake)."""
+        if isinstance(v, str):
+            return v.strip("\"'")
+        return v
 
     FIREBASE_SERVICE_ACCOUNT_JSON: str = Field(default="{}")
     FIREBASE_PROJECT_ID: str = Field(default="")
