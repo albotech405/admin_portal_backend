@@ -1,3 +1,4 @@
+import base64
 from typing import Optional, List
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -7,7 +8,17 @@ from app.core.supabase import get_supabase
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
-_JWT_SECRET = settings.SUPABASE_JWT_SECRET
+
+def _load_jwt_secret(raw: str) -> bytes:
+    """Supabase GoTrue signs JWTs with the base64-decoded bytes of the secret.
+    Decode here so python-jose uses the same key bytes for verification."""
+    try:
+        return base64.b64decode(raw + "=" * (-len(raw) % 4))
+    except Exception:
+        return raw.encode("utf-8")
+
+
+_JWT_SECRET = _load_jwt_secret(settings.SUPABASE_JWT_SECRET)
 
 # Role hierarchy: higher index = more permissive override
 ROLE_HIERARCHY = ["readonly", "support", "finance", "operations", "super_admin"]
