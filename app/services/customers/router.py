@@ -45,7 +45,6 @@ class CreateCustomerRequest(BaseModel):
     full_name: str = Field(..., min_length=2, max_length=100)
     phone_number: str = Field(..., min_length=7, max_length=20)
     email: Optional[str] = None
-    password: str = Field(..., min_length=8)
 
     @field_validator("phone_number")
     @classmethod
@@ -60,6 +59,7 @@ class CreateCustomerResponse(BaseModel):
     full_name: str
     phone_number: str
     role: str
+    otp_sent: bool
 
 
 def _email_or_placeholder(email: Optional[str], phone: str) -> str:
@@ -93,19 +93,17 @@ def create_customer(body: CreateCustomerRequest, _user: dict = Depends(require_r
     if phone_check.data:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Phone number already registered")
 
-    email_addr = _email_or_placeholder(body.email, body.phone_number)
-
-    # 2. Create Supabase Auth user
+    # 2. Create Supabase Auth user (phone-only, no password — OTP login)
     try:
         from gotrue.types import AdminUserAttributes
         auth_result = sb.auth.admin.create_user(
-            AdminUserAttributes(email=email_addr, password=body.password, email_confirm=True)
+            AdminUserAttributes(phone=body.phone_number, phone_confirm=True)
         )
         auth_uid = auth_result.user.id
     except Exception as exc:
         msg = str(exc).lower()
         if "already registered" in msg or "already been registered" in msg:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Phone number already registered")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
 
     # 3. Insert into users table
@@ -140,7 +138,16 @@ def create_customer(body: CreateCustomerRequest, _user: dict = Depends(require_r
     except Exception:
         pass  # Table may not exist; non-fatal
 
-    # 5. Audit log
+    # 5. Trigger OTP — sends SMS via Twilio; non-fatal if it fails
+    otp_sent = True
+    try:
+        sb.auth.sign_in_with_otp({"phone": body.phone_number})
+    except Exception as otp_exc:
+        import logging as _logging
+        _logging.getLogger(__name__).warning("OTP send failed for %s: %s", body.phone_number, otp_exc)
+        otp_sent = False
+
+    # 6. Audit log
     write_audit_log(
         sb=sb,
         admin_user=_user,
@@ -156,6 +163,7 @@ def create_customer(body: CreateCustomerRequest, _user: dict = Depends(require_r
         full_name=body.full_name,
         phone_number=body.phone_number,
         role="customer",
+        otp_sent=otp_sent,
     )
 
 

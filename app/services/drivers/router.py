@@ -72,7 +72,6 @@ class CreateDriverRequest(BaseModel):
     full_name: str = Field(..., min_length=2, max_length=100)
     phone_number: str = Field(..., min_length=7, max_length=20)
     email: Optional[str] = None
-    password: str = Field(..., min_length=8)
     license_number: str = Field(..., min_length=3, max_length=30)
     license_expiry: date
     vehicle_type: str = Field(..., pattern=r"^(car|moto|tuk_tuk|van|suv)$")
@@ -91,13 +90,7 @@ class CreateDriverResponse(BaseModel):
     phone_number: str
     role: str
     verification_status: str
-
-
-def _email_or_placeholder(email: Optional[str], phone: str) -> str:
-    if email:
-        return email
-    digits = re.sub(r"\D", "", phone)
-    return f"{digits}@noemail.placeholder.local"
+    otp_sent: bool
 
 
 _DRIVER_FIELDS = {f for f in DriverAdminListItem.model_fields if f not in ("full_name", "phone_number", "total_trips")}
@@ -120,19 +113,17 @@ def create_driver(body: CreateDriverRequest, _user: dict = Depends(require_role(
     if phone_check.data:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Phone number already registered")
 
-    email_addr = _email_or_placeholder(body.email, body.phone_number)
-
-    # 2. Create Supabase Auth user
+    # 2. Create Supabase Auth user (phone-only, no password — OTP login)
     try:
         from gotrue.types import AdminUserAttributes
         auth_result = sb.auth.admin.create_user(
-            AdminUserAttributes(email=email_addr, password=body.password, email_confirm=True)
+            AdminUserAttributes(phone=body.phone_number, phone_confirm=True)
         )
         auth_uid = auth_result.user.id
     except Exception as exc:
         msg = str(exc).lower()
         if "already registered" in msg or "already been registered" in msg:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Phone number already registered")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
 
     # 3. Insert into users table
@@ -178,7 +169,16 @@ def create_driver(body: CreateDriverRequest, _user: dict = Depends(require_role(
             pass
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
 
-    # 5. Audit log
+    # 5. Trigger OTP — sends SMS via Twilio; non-fatal if it fails
+    otp_sent = True
+    try:
+        sb.auth.sign_in_with_otp({"phone": body.phone_number})
+    except Exception as otp_exc:
+        import logging as _logging
+        _logging.getLogger(__name__).warning("OTP send failed for %s: %s", body.phone_number, otp_exc)
+        otp_sent = False
+
+    # 6. Audit log
     write_audit_log(
         sb=sb,
         admin_user=_user,
@@ -201,6 +201,7 @@ def create_driver(body: CreateDriverRequest, _user: dict = Depends(require_role(
         phone_number=body.phone_number,
         role="driver",
         verification_status="pending",
+        otp_sent=otp_sent,
     )
 
 
