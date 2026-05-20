@@ -4,6 +4,7 @@ from typing import Optional, Any, List
 from datetime import datetime, timezone
 from app.core.dependencies import require_admin
 from app.core.supabase import get_supabase
+from app.services.notifications.router import send_push_to_users
 
 router = APIRouter(prefix="/rides", tags=["disputes"])
 
@@ -124,6 +125,25 @@ def _fetch_dispute_rides(sb, status_filter: Optional[str] = None) -> list:
     return []
 
 
+def _get_dispute_parties(sb, ride_id: str) -> dict:
+    """Return customer_user_id and driver_user_id for a ride."""
+    try:
+        ride = sb.table("rides").select("customer_id, driver_id").eq("id", ride_id).maybe_single().execute()
+        if not ride.data:
+            return {}
+        driver_id = ride.data.get("driver_id")
+        driver_user_id = None
+        if driver_id:
+            dp = sb.table("driver_profiles").select("user_id").eq("id", driver_id).maybe_single().execute()
+            driver_user_id = (dp.data or {}).get("user_id")
+        return {
+            "customer_user_id": ride.data.get("customer_id"),
+            "driver_user_id": driver_user_id,
+        }
+    except Exception:
+        return {}
+
+
 def _update_dispute_status(
     sb, ride_id: str, new_status: str, notes: Optional[str] = None, admin_id: Optional[str] = None
 ):
@@ -195,6 +215,20 @@ def refund_dispute(
         except Exception:
             pass
 
+        # Push notification to customer
+        try:
+            parties = _get_dispute_parties(sb, ride_id)
+            if parties.get("customer_user_id"):
+                send_push_to_users(
+                    [parties["customer_user_id"]],
+                    "Dispute Resolved \u2013 Refund Issued",
+                    "Your dispute has been resolved and a refund has been issued. Please allow some time for processing.",
+                    notification_type="payment_update",
+                    persist=False,
+                )
+        except Exception:
+            pass
+
         return DisputeActionResponse(
             message="Dispute resolved: refund issued (manual processing required)",
             ride_id=ride_id,
@@ -261,6 +295,20 @@ def charge_driver_dispute(
 
         _update_dispute_status(sb, ride_id, "driver_charged", body.notes, admin_id)
 
+        # Push notification to driver
+        try:
+            dp_user = sb.table("driver_profiles").select("user_id").eq("id", driver_id).maybe_single().execute()
+            if dp_user.data and dp_user.data.get("user_id"):
+                send_push_to_users(
+                    [dp_user.data["user_id"]],
+                    "Dispute Resolution \u2013 Charge Applied",
+                    f"{fee_amount} CDF has been deducted from your wallet as a dispute resolution charge.",
+                    notification_type="payment_update",
+                    persist=False,
+                )
+        except Exception:
+            pass
+
         return DisputeActionResponse(
             message=f"Driver charged {fee_amount} CDF for dispute resolution",
             ride_id=ride_id,
@@ -285,6 +333,22 @@ def dismiss_dispute(
         sb = get_supabase()
         admin_id = _user.get("id") or _user.get("user_id") or "unknown"
         _update_dispute_status(sb, ride_id, "dismissed", body.notes, admin_id)
+
+        # Notify whichever party raised the dispute
+        try:
+            log = sb.table("dispute_logs").select("raised_by, ride_id").eq("ride_id", ride_id).maybe_single().execute()
+            parties = _get_dispute_parties(sb, ride_id)
+            raised_by = (log.data or {}).get("raised_by", "customer")
+            target_uid = parties.get("customer_user_id") if raised_by == "customer" else parties.get("driver_user_id")
+            if target_uid:
+                send_push_to_users(
+                    [target_uid], "Dispute Closed",
+                    "Your dispute has been reviewed and closed by the admin team.",
+                    notification_type="system", persist=False,
+                )
+        except Exception:
+            pass
+
         return DisputeActionResponse(
             message="Dispute dismissed",
             ride_id=ride_id,
@@ -307,6 +371,22 @@ def escalate_dispute(
         sb = get_supabase()
         admin_id = _user.get("id") or _user.get("user_id") or "unknown"
         _update_dispute_status(sb, ride_id, "escalated", body.notes, admin_id)
+
+        # Notify whichever party raised the dispute
+        try:
+            log = sb.table("dispute_logs").select("raised_by").eq("ride_id", ride_id).maybe_single().execute()
+            parties = _get_dispute_parties(sb, ride_id)
+            raised_by = (log.data or {}).get("raised_by", "customer")
+            target_uid = parties.get("customer_user_id") if raised_by == "customer" else parties.get("driver_user_id")
+            if target_uid:
+                send_push_to_users(
+                    [target_uid], "Dispute Escalated",
+                    "Your dispute has been escalated for further review. We will follow up with you shortly.",
+                    notification_type="system", persist=False,
+                )
+        except Exception:
+            pass
+
         return DisputeActionResponse(
             message="Dispute escalated to Super Admin",
             ride_id=ride_id,

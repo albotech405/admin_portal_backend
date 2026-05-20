@@ -1,8 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional, List
-from app.core.dependencies import require_admin
+from datetime import datetime, timezone
+from app.core.dependencies import require_admin, get_current_user
 from app.core.supabase import get_supabase
+from app.services.notifications.router import send_push_to_users
 
 router = APIRouter(prefix="/sos", tags=["sos"])
 
@@ -58,6 +60,79 @@ class SosSessionDetailResponse(BaseModel):
 
 class ResolveSosBody(BaseModel):
     resolution_notes: Optional[str] = None
+
+
+class TriggerSosBody(BaseModel):
+    ride_id: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    triggered_by_driver: bool = False
+
+
+@router.post("/trigger")
+def trigger_sos(
+    body: TriggerSosBody,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Triggered by the mobile app when an SOS event occurs.
+    Creates an SOS session and immediately notifies all admin users via push.
+    """
+    from uuid import uuid4
+
+    sb = get_supabase()
+    auth_uid = user["id"]
+
+    # Resolve internal user id
+    user_row = None
+    try:
+        result = sb.table("users").select("id, full_name").eq("supabase_uid", auth_uid).limit(1).execute()
+        user_row = result.data[0] if result.data else None
+    except Exception:
+        pass
+    if not user_row:
+        try:
+            result = sb.table("users").select("id, full_name").eq("id", auth_uid).limit(1).execute()
+            user_row = result.data[0] if result.data else None
+        except Exception:
+            pass
+
+    user_id = (user_row or {}).get("id", auth_uid)
+    user_name = (user_row or {}).get("full_name", "Unknown user")
+    now = datetime.now(timezone.utc).isoformat()
+
+    session_id = str(uuid4())
+    try:
+        sb.table("sos_sessions").insert({
+            "id": session_id,
+            "user_id": user_id,
+            "is_active": True,
+            "triggered_at": now,
+            "ride_id": body.ride_id,
+            "last_latitude": body.latitude,
+            "last_longitude": body.longitude,
+            "triggered_by_driver": body.triggered_by_driver,
+        }).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create SOS session: {e}")
+
+    # Notify all admin users
+    try:
+        admin_result = sb.table("users").select("id").eq("is_admin", True).eq("is_active", True).execute()
+        admin_ids = [r["id"] for r in (admin_result.data or [])]
+        if admin_ids:
+            ride_info = f" on ride {body.ride_id}" if body.ride_id else ""
+            send_push_to_users(
+                admin_ids,
+                "SOS Alert",
+                f"SOS triggered by {user_name}{ride_info}. Immediate attention required.",
+                notification_type="system",
+                persist=True,
+            )
+    except Exception:
+        pass
+
+    return {"session_id": session_id, "message": "SOS triggered"}
 
 
 @router.get("/admin/sessions", response_model=SosSessionListResponse)

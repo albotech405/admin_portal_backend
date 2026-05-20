@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 from app.core.dependencies import require_admin
 from app.core.supabase import call_rpc, first_row, get_supabase
+from app.services.notifications.router import send_push_to_users
 
 router = APIRouter(prefix="/drivers", tags=["drivers"])
 
@@ -258,6 +259,20 @@ def suspend_driver(driver_id: str, body: SuspendDriverBody, _user=Depends(requir
         raise HTTPException(status_code=500, detail=str(e))
     if not result:
         raise HTTPException(status_code=404, detail="Driver not found")
+
+    # Push notification to driver
+    try:
+        sb = get_supabase()
+        dp = sb.table("driver_profiles").select("user_id").eq("id", driver_id).maybe_single().execute()
+        if dp.data and dp.data.get("user_id"):
+            msg = f"Your driver account has been suspended. Reason: {body.reason}"
+            send_push_to_users(
+                [dp.data["user_id"]], "Account Suspended", msg,
+                notification_type="driver_update", persist=False,
+            )
+    except Exception:
+        pass
+
     return result
 
 
@@ -274,6 +289,22 @@ def unsuspend_driver(driver_id: str, _user=Depends(require_admin)):
         raise HTTPException(status_code=500, detail=str(e))
     if not result:
         raise HTTPException(status_code=404, detail="Driver not found")
+
+    # Push notification to driver
+    try:
+        sb = get_supabase()
+        dp = sb.table("driver_profiles").select("user_id").eq("id", driver_id).maybe_single().execute()
+        if dp.data and dp.data.get("user_id"):
+            send_push_to_users(
+                [dp.data["user_id"]],
+                "Account Reinstated",
+                "Your driver account has been reinstated. You can go online and accept rides again.",
+                notification_type="driver_update",
+                persist=False,
+            )
+    except Exception:
+        pass
+
     return result
 
 

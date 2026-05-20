@@ -1,8 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional, Any, List
-from app.core.dependencies import require_admin
+from datetime import datetime, timezone
+from app.core.dependencies import require_admin, get_current_user
 from app.core.supabase import get_supabase
+from app.services.notifications.router import send_push_to_users
 
 router = APIRouter(prefix="/rides", tags=["rides"])
 
@@ -865,6 +867,7 @@ def deduct_commission(ride_id: str, _user=Depends(require_admin)):
     or to retry a failed deduction.
     """
     from app.core.supabase import call_rpc, first_row
+    from app.core.config import settings
     try:
         result = first_row(
             call_rpc("deduct_commission", {"p_ride_id": ride_id})
@@ -873,4 +876,149 @@ def deduct_commission(ride_id: str, _user=Depends(require_admin)):
         raise HTTPException(status_code=500, detail=str(e))
     if not result:
         raise HTTPException(status_code=404, detail="Ride not found or commission not applicable")
+
+    # Low-balance alert: push if new_balance < LOW_BALANCE_THRESHOLD
+    try:
+        new_balance = result.get("new_balance") if isinstance(result, dict) else None
+        driver_profile_id = result.get("driver_id") if isinstance(result, dict) else None
+        if new_balance is not None and driver_profile_id is not None:
+            threshold = getattr(settings, "LOW_BALANCE_THRESHOLD", 500)
+            if float(new_balance) < float(threshold):
+                sb = get_supabase()
+                dp = sb.table("driver_profiles").select("user_id").eq("id", driver_profile_id).maybe_single().execute()
+                driver_user_id = (dp.data or {}).get("user_id")
+                if driver_user_id:
+                    # Rate-limit: check last low-balance notification in past 24h
+                    from datetime import timedelta
+                    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+                    existing = (
+                        sb.table("notifications")
+                        .select("id", count="exact")
+                        .eq("user_id", driver_user_id)
+                        .eq("notification_type", "low_balance")
+                        .gte("created_at", cutoff)
+                        .execute()
+                    )
+                    if not (existing.count and existing.count > 0):
+                        send_push_to_users(
+                            [driver_user_id],
+                            "Low Wallet Balance",
+                            f"Your wallet balance is low ({new_balance:.2f} CDF). Please top up to continue accepting rides.",
+                            notification_type="low_balance",
+                            persist=True,
+                        )
+    except Exception:
+        pass
+
     return result
+
+
+# ── Ride lifecycle status update (mobile-facing) ─────────────────────────
+
+
+_RIDE_STATUS_NOTIFICATIONS = {
+    "driver_en_route": {
+        "target": "customer",
+        "title": "Driver On The Way",
+        "message": "Your driver is on the way.",
+    },
+    "arrived": {
+        "target": "customer",
+        "title": "Driver Arrived",
+        "message": "Your driver has arrived at the pickup point.",
+    },
+    "in_progress": {
+        "target": "customer",
+        "title": "Ride Started",
+        "message": "Your ride has started. Enjoy your trip!",
+    },
+    "completed": {
+        "target": "customer",
+        "title": "Ride Completed",
+        "message": "Your ride is complete.",
+    },
+    "cancelled_by_driver": {
+        "target": "customer",
+        "title": "Ride Cancelled",
+        "message": "Your ride was cancelled by the driver. Please request a new ride.",
+    },
+    "cancelled_by_customer": {
+        "target": "driver",
+        "title": "Ride Cancelled by Customer",
+        "message": "The customer has cancelled the ride.",
+    },
+}
+
+
+class RideStatusUpdateBody(BaseModel):
+    status: str
+    driver_name: Optional[str] = None
+    eta_minutes: Optional[int] = None
+    price: Optional[float] = None
+
+
+@router.patch("/{ride_id}/status")
+def update_ride_status(
+    ride_id: str,
+    body: RideStatusUpdateBody,
+    _user: dict = Depends(get_current_user),
+):
+    """
+    Update ride status (mobile-app facing). Fires push notifications to the
+    appropriate party based on the new status.
+    """
+    sb = get_supabase()
+
+    try:
+        ride = sb.table("rides").select("customer_id, driver_id, price, status").eq("id", ride_id).maybe_single().execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not ride.data:
+        raise HTTPException(status_code=404, detail="Ride not found")
+
+    now = datetime.now(timezone.utc).isoformat()
+    update_data: dict = {"status": body.status}
+    if body.status == "in_progress":
+        update_data["started_at"] = now
+    elif body.status in ("completed", "cancelled_by_driver", "cancelled_by_customer"):
+        update_data["completed_at"] = now
+
+    try:
+        sb.table("rides").update(update_data).eq("id", ride_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Push notification
+    notif_cfg = _RIDE_STATUS_NOTIFICATIONS.get(body.status)
+    if notif_cfg:
+        try:
+            customer_id = ride.data.get("customer_id")
+            driver_profile_id = ride.data.get("driver_id")
+            driver_user_id = None
+            if driver_profile_id:
+                dp = sb.table("driver_profiles").select("user_id").eq("id", driver_profile_id).maybe_single().execute()
+                driver_user_id = (dp.data or {}).get("user_id")
+
+            target = notif_cfg["target"]
+            title = notif_cfg["title"]
+            message = notif_cfg["message"]
+
+            # Enrich message with dynamic values
+            if body.status == "driver_en_route" and body.driver_name:
+                eta = f" ETA: {body.eta_minutes} min." if body.eta_minutes else ""
+                message = f"Your driver {body.driver_name} is on the way.{eta}"
+            elif body.status == "completed":
+                price_val = body.price or float(ride.data.get("price") or 0)
+                message = f"Your ride is complete. Total: {price_val:.0f} CDF."
+
+            target_uid = customer_id if target == "customer" else driver_user_id
+            if target_uid:
+                send_push_to_users(
+                    [target_uid], title, message,
+                    notification_type="ride_update", persist=True,
+                )
+        except Exception:
+            pass
+
+    return {"ride_id": ride_id, "status": body.status}

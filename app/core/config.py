@@ -28,7 +28,10 @@ class Settings(BaseSettings):
         return v
 
     FIREBASE_SERVICE_ACCOUNT_JSON: str = Field(default="{}")
+    FIREBASE_SERVICE_ACCOUNT_PATH: str = Field(default="")
     FIREBASE_PROJECT_ID: str = Field(default="")
+
+    LOW_BALANCE_THRESHOLD: float = Field(default=500.0)
 
     ALLOWED_ORIGINS: str = Field(default="http://localhost:3000,http://localhost:3001,http://localhost:5173")
 

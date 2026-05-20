@@ -1,5 +1,6 @@
 import json
 import logging
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import firebase_admin
@@ -13,16 +14,34 @@ _app: Optional[firebase_admin.App] = None
 
 
 def _get_app() -> firebase_admin.App:
-    """Initialize the Firebase app once and return it."""
+    """Initialize the Firebase app once and return it.
+
+    Priority:
+    1. FIREBASE_SERVICE_ACCOUNT_PATH  — path to a JSON file on disk
+    2. FIREBASE_SERVICE_ACCOUNT_JSON  — the JSON content itself (inline)
+    """
     global _app
     if _app is not None:
         return _app
 
+    # Try path-based config first
+    path_str = (settings.FIREBASE_SERVICE_ACCOUNT_PATH or "").strip()
+    if path_str:
+        path = Path(path_str)
+        if not path.is_file():
+            raise RuntimeError(
+                f"FIREBASE_SERVICE_ACCOUNT_PATH points to a non-existent file: {path_str}"
+            )
+        cred = credentials.Certificate(str(path))
+        _app = firebase_admin.initialize_app(cred)
+        return _app
+
+    # Fall back to inline JSON
     raw = settings.FIREBASE_SERVICE_ACCOUNT_JSON.strip()
     if not raw or raw == "{}":
         raise RuntimeError(
-            "FIREBASE_SERVICE_ACCOUNT_JSON is not configured. "
-            "Set it in your .env to enable push notifications."
+            "Neither FIREBASE_SERVICE_ACCOUNT_PATH nor FIREBASE_SERVICE_ACCOUNT_JSON "
+            "is configured. Set one of them in your .env to enable push notifications."
         )
 
     service_account_info = json.loads(raw)
