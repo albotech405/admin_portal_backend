@@ -1,10 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+import re
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Any
 from datetime import datetime, timezone
 from uuid import uuid4
-from app.core.dependencies import require_admin
+from app.core.dependencies import require_admin, require_role
 from app.core.supabase import get_supabase
+from app.services.audit.router import write_audit_log
 
 router = APIRouter(prefix="/customers", tags=["customers"])
 
@@ -39,11 +41,122 @@ class BanUnbanBody(BaseModel):
     reason: Optional[str] = None
 
 
+class CreateCustomerRequest(BaseModel):
+    full_name: str = Field(..., min_length=2, max_length=100)
+    phone_number: str = Field(..., min_length=7, max_length=20)
+    email: Optional[str] = None
+    password: str = Field(..., min_length=8)
+
+    @field_validator("phone_number")
+    @classmethod
+    def phone_digits_only(cls, v: str) -> str:
+        if not re.match(r"^\+?[\d\s\-]{7,20}$", v):
+            raise ValueError("Invalid phone number format")
+        return v
+
+
+class CreateCustomerResponse(BaseModel):
+    id: str
+    full_name: str
+    phone_number: str
+    role: str
+
+
+def _email_or_placeholder(email: Optional[str], phone: str) -> str:
+    if email:
+        return email
+    digits = re.sub(r"\D", "", phone)
+    return f"{digits}@noemail.placeholder.local"
+
+
 _CUSTOMER_FIELDS = {
     "id", "full_name", "phone_number", "email", "is_active", "is_admin",
     "gender", "profile_image_url", "customer_rating", "total_customer_ratings",
     "created_at", "updated_at", "privacy_preferences",
 }
+
+
+@router.post(
+    "/admin/create",
+    status_code=status.HTTP_201_CREATED,
+    response_model=CreateCustomerResponse,
+    dependencies=[Depends(require_role("operations", "super_admin"))],
+)
+def create_customer(body: CreateCustomerRequest, _user: dict = Depends(require_role("operations", "super_admin"))):
+    sb = get_supabase()
+
+    # 1. Check phone uniqueness
+    try:
+        phone_check = sb.table("users").select("id").eq("phone_number", body.phone_number).limit(1).execute()
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+    if phone_check.data:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Phone number already registered")
+
+    email_addr = _email_or_placeholder(body.email, body.phone_number)
+
+    # 2. Create Supabase Auth user
+    try:
+        from gotrue.types import AdminUserAttributes
+        auth_result = sb.auth.admin.create_user(
+            AdminUserAttributes(email=email_addr, password=body.password, email_confirm=True)
+        )
+        auth_uid = auth_result.user.id
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "already registered" in msg or "already been registered" in msg:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+
+    # 3. Insert into users table
+    new_user_id = str(uuid4())
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        sb.table("users").insert({
+            "id": new_user_id,
+            "supabase_uid": auth_uid,
+            "full_name": body.full_name,
+            "phone_number": body.phone_number,
+            "email": body.email,
+            "role": "customer",
+            "is_active": True,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        }).execute()
+    except Exception as exc:
+        # Best-effort: clean up auth user so we don't leave orphaned auth accounts
+        try:
+            sb.auth.admin.delete_user(auth_uid)
+        except Exception:
+            pass
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+
+    # 4. Insert into customer_profiles if the table exists
+    try:
+        sb.table("customer_profiles").insert({
+            "user_id": new_user_id,
+            "created_at": now_iso,
+        }).execute()
+    except Exception:
+        pass  # Table may not exist; non-fatal
+
+    # 5. Audit log
+    write_audit_log(
+        sb=sb,
+        admin_user=_user,
+        action_type="manual_user_create",
+        entity_type="users",
+        entity_id=new_user_id,
+        summary=f"Admin manually created customer: {body.full_name} ({body.phone_number})",
+        after_state={"full_name": body.full_name, "phone_number": body.phone_number, "role": "customer"},
+    )
+
+    return CreateCustomerResponse(
+        id=new_user_id,
+        full_name=body.full_name,
+        phone_number=body.phone_number,
+        role="customer",
+    )
 
 
 @router.get("/admin/list", response_model=CustomerAdminListResponse)

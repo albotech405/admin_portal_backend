@@ -1,9 +1,13 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+import re
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List
-from app.core.dependencies import require_admin
+from datetime import date, datetime, timezone
+from uuid import uuid4
+from app.core.dependencies import require_admin, require_role
 from app.core.supabase import call_rpc, first_row, get_supabase
 from app.services.notifications.router import send_push_to_users
+from app.services.audit.router import write_audit_log
 
 router = APIRouter(prefix="/drivers", tags=["drivers"])
 
@@ -64,7 +68,140 @@ class DriverAdminListResponse(BaseModel):
     total: int
 
 
+class CreateDriverRequest(BaseModel):
+    full_name: str = Field(..., min_length=2, max_length=100)
+    phone_number: str = Field(..., min_length=7, max_length=20)
+    email: Optional[str] = None
+    password: str = Field(..., min_length=8)
+    license_number: str = Field(..., min_length=3, max_length=30)
+    license_expiry: date
+    vehicle_type: str = Field(..., pattern=r"^(car|moto|tuk_tuk|van|suv)$")
+
+    @field_validator("phone_number")
+    @classmethod
+    def phone_digits_only(cls, v: str) -> str:
+        if not re.match(r"^\+?[\d\s\-]{7,20}$", v):
+            raise ValueError("Invalid phone number format")
+        return v
+
+
+class CreateDriverResponse(BaseModel):
+    id: str
+    full_name: str
+    phone_number: str
+    role: str
+    verification_status: str
+
+
+def _email_or_placeholder(email: Optional[str], phone: str) -> str:
+    if email:
+        return email
+    digits = re.sub(r"\D", "", phone)
+    return f"{digits}@noemail.placeholder.local"
+
+
 _DRIVER_FIELDS = {f for f in DriverAdminListItem.model_fields if f not in ("full_name", "phone_number", "total_trips")}
+
+
+@router.post(
+    "/admin/create",
+    status_code=status.HTTP_201_CREATED,
+    response_model=CreateDriverResponse,
+    dependencies=[Depends(require_role("operations", "super_admin"))],
+)
+def create_driver(body: CreateDriverRequest, _user: dict = Depends(require_role("operations", "super_admin"))):
+    sb = get_supabase()
+
+    # 1. Check phone uniqueness
+    try:
+        phone_check = sb.table("users").select("id").eq("phone_number", body.phone_number).limit(1).execute()
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+    if phone_check.data:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Phone number already registered")
+
+    email_addr = _email_or_placeholder(body.email, body.phone_number)
+
+    # 2. Create Supabase Auth user
+    try:
+        from gotrue.types import AdminUserAttributes
+        auth_result = sb.auth.admin.create_user(
+            AdminUserAttributes(email=email_addr, password=body.password, email_confirm=True)
+        )
+        auth_uid = auth_result.user.id
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "already registered" in msg or "already been registered" in msg:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+
+    # 3. Insert into users table
+    new_user_id = str(uuid4())
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        sb.table("users").insert({
+            "id": new_user_id,
+            "supabase_uid": auth_uid,
+            "full_name": body.full_name,
+            "phone_number": body.phone_number,
+            "email": body.email,
+            "role": "driver",
+            "is_active": True,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        }).execute()
+    except Exception as exc:
+        try:
+            sb.auth.admin.delete_user(auth_uid)
+        except Exception:
+            pass
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+
+    # 4. Insert into driver_profiles
+    try:
+        sb.table("driver_profiles").insert({
+            "user_id": new_user_id,
+            "license_number": body.license_number,
+            "license_expiry": body.license_expiry.isoformat(),
+            "vehicle_type": body.vehicle_type,
+            "verification_status": "pending",
+            "is_online": False,
+            "rating": 0,
+            "total_trips": 0,
+            "created_at": now_iso,
+        }).execute()
+    except Exception as exc:
+        # users row was created; try to clean up auth but leave users row for data integrity
+        try:
+            sb.auth.admin.delete_user(auth_uid)
+        except Exception:
+            pass
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+
+    # 5. Audit log
+    write_audit_log(
+        sb=sb,
+        admin_user=_user,
+        action_type="manual_user_create",
+        entity_type="users",
+        entity_id=new_user_id,
+        summary=f"Admin manually created driver: {body.full_name} ({body.phone_number})",
+        after_state={
+            "full_name": body.full_name,
+            "phone_number": body.phone_number,
+            "role": "driver",
+            "license_number": body.license_number,
+            "vehicle_type": body.vehicle_type,
+        },
+    )
+
+    return CreateDriverResponse(
+        id=new_user_id,
+        full_name=body.full_name,
+        phone_number=body.phone_number,
+        role="driver",
+        verification_status="pending",
+    )
 
 
 @router.get("/admin/list", response_model=DriverAdminListResponse)
