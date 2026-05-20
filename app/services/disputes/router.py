@@ -68,7 +68,7 @@ def _fetch_dispute_rides(sb, status_filter: Optional[str] = None) -> list:
                 "*, "
                 "rides!inner("
                 "  *, "
-                "  users!rides_customer_id_fkey(full_name, phone_number), "
+                "  users!rides_client_id_fkey(full_name, phone_number), "
                 "  driver_profiles!rides_driver_id_fkey(users!driver_profiles_user_id_fkey(full_name, phone_number))"
                 ")"
             )

@@ -149,8 +149,8 @@ _RIDE_DETAIL_FIELDS = {
     "id", "ride_request_id", "customer_id", "driver_id", "customer_phone",
     "driver_phone", "picking_point", "destination", "customer_comment",
     "price", "status", "started_at", "completed_at", "cancelled_at",
-    "cancelled_by", "cancellation_reason", "created_at", "customer_name",
-    "customer_avatar_url", "driver_name", "driver_phone", "driver_avatar_url",
+    "cancelled_by", "cancellation_reason", "created_at",
+    "customer_name", "customer_avatar_url", "driver_name", "driver_avatar_url",
     "distance_km", "duration_minutes", "platform_commission_amount",
     "arrived_at", "vehicle_snapshot", "category", "stops",
     "reason_code", "reason_text",
@@ -186,35 +186,21 @@ def get_ride_detail(ride_id: str, _user=Depends(require_admin)):
         sb = get_supabase()
         result = (
             sb.table("rides")
-            .select(
-                "*, "
-                "users!rides_customer_id_fkey(full_name, phone_number, profile_image_url), "
-                "driver_profiles!rides_driver_id_fkey(users!driver_profiles_user_id_fkey(full_name, phone_number, profile_image_url))"
-            )
+            .select("*")
             .eq("id", ride_id)
-            .maybe_single()
+            .limit(1)
             .execute()
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    if not result.data:
+    rows = result.data or []
+    if not rows:
         raise HTTPException(status_code=404, detail="Ride not found")
 
-    r = result.data
-    customer_info = r.pop("users", {}) or {}
-    driver_profile = r.pop("driver_profiles", None) or {}
-    driver_user_info = driver_profile.pop("users", {}) if isinstance(driver_profile, dict) else {}
-
+    r = rows[0]
     row_fields = {k: v for k, v in r.items() if k in _RIDE_DETAIL_FIELDS}
-    return RideDetailResponse(
-        **row_fields,
-        customer_name=customer_info.get("full_name"),
-        customer_avatar_url=customer_info.get("profile_image_url"),
-        driver_name=driver_user_info.get("full_name"),
-        driver_phone=driver_user_info.get("phone_number"),
-        driver_avatar_url=driver_user_info.get("profile_image_url"),
-    )
+    return RideDetailResponse(**row_fields)
 
 
 @router.get("/trips/{trip_id}", response_model=TripResponse)
@@ -223,27 +209,20 @@ def get_trip_detail(trip_id: str, _user=Depends(require_admin)):
         sb = get_supabase()
         result = (
             sb.table("rides")
-            .select(
-                "*, "
-                "users!rides_customer_id_fkey(full_name, phone_number), "
-                "driver_profiles!rides_driver_id_fkey(users!driver_profiles_user_id_fkey(full_name, phone_number))"
-            )
+            .select("*")
             .eq("id", trip_id)
             .in_("status", ["completed", "cancelled"])
-            .maybe_single()
+            .limit(1)
             .execute()
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    if not result.data:
+    rows = result.data or []
+    if not rows:
         raise HTTPException(status_code=404, detail="Trip not found")
 
-    r = result.data
-    customer_info = r.pop("users", {}) or {}
-    driver_profile = r.pop("driver_profiles", None) or {}
-    driver_user_info = driver_profile.pop("users", {}) if isinstance(driver_profile, dict) else {}
-
+    r = rows[0]
     # Fetch ratings
     customer_rating = None
     driver_rating = None
@@ -265,10 +244,10 @@ def get_trip_detail(trip_id: str, _user=Depends(require_admin)):
         ride_request_id=r.get("ride_request_id"),
         customer_id=r.get("customer_id"),
         driver_id=r.get("driver_id"),
-        customer_name=customer_info.get("full_name"),
-        customer_phone=customer_info.get("phone_number"),
-        driver_name=driver_user_info.get("full_name"),
-        driver_phone=driver_user_info.get("phone_number"),
+        customer_name=r.get("customer_name"),
+        customer_phone=r.get("customer_phone"),
+        driver_name=r.get("driver_name"),
+        driver_phone=r.get("driver_phone"),
         picking_point=r.get("picking_point"),
         destination=r.get("destination"),
         price=float(r.get("price", 0)),
