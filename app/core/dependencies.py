@@ -66,21 +66,30 @@ def require_admin(user: dict = Depends(get_current_user)):
     if user.get("role") == "service_role":
         return user
 
+    # The auth UUID is stored in users.supabase_uid (users.id is the app-internal PK)
+    auth_id = user["id"]
     sb = get_supabase()
-    result = (
-        sb.table("users")
-        .select("is_admin, is_active, admin_role")
-        .eq("id", user["id"])
-        .maybe_single()
-        .execute()
-    )
-    if not result.data or not result.data.get("is_admin"):
+    try:
+        result = (
+            sb.table("users")
+            .select("id, is_admin, is_active, admin_role")
+            .eq("supabase_uid", auth_id)
+            .limit(1)
+            .execute()
+        )
+        row = result.data[0] if result.data else None
+    except Exception as exc:
+        logger.error("Admin DB lookup failed: %s", exc)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error during admin check")
+
+    if not row or not row.get("is_admin"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
-    if not result.data.get("is_active", True):
+    if not row.get("is_active", True):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin account disabled")
 
-    # Attach admin_role to the user dict for downstream use
-    user["admin_role"] = result.data.get("admin_role")
+    # Replace auth UUID with the internal users-table PK so downstream queries work
+    user["id"] = row["id"]
+    user["admin_role"] = row.get("admin_role")
     return user
 
 
