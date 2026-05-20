@@ -1,10 +1,12 @@
 from typing import Optional, List
+import logging
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
 from app.core.config import settings
 from app.core.supabase import get_supabase
 
+logger = logging.getLogger(__name__)
 bearer_scheme = HTTPBearer(auto_error=False)
 
 # Role hierarchy: higher index = more permissive override
@@ -15,8 +17,8 @@ def _verify_token(token: str) -> dict:
     """
     Verify a bearer token.
 
-    1. Try Supabase auth API (handles all real user JWTs regardless of secret encoding).
-    2. Fall back to local HS256 decode for service_role tokens used in backend tests.
+    1. Try Supabase auth API — works for ES256 user JWTs (the format Supabase now issues).
+    2. Fall back to local HS256 decode for service_role tokens signed internally.
     """
     # --- Primary: ask Supabase to validate the token ---
     try:
@@ -24,10 +26,11 @@ def _verify_token(token: str) -> dict:
         resp = sb.auth.get_user(token)
         if resp and resp.user:
             return {"id": resp.user.id, "role": "authenticated"}
-    except Exception:
-        pass
+        logger.warning("auth.get_user returned no user for token")
+    except Exception as exc:
+        logger.warning("auth.get_user failed: %s", exc)
 
-    # --- Fallback: local decode for service_role / internal tokens ---
+    # --- Fallback: local decode for HS256 service_role tokens ---
     try:
         payload = jwt.decode(
             token,
@@ -35,11 +38,10 @@ def _verify_token(token: str) -> dict:
             algorithms=["HS256"],
             options={"verify_aud": False},
         )
-        role = payload.get("role", "authenticated")
-        if role == "service_role":
+        if payload.get("role") == "service_role":
             return {"id": payload.get("sub"), "role": "service_role"}
-    except JWTError:
-        pass
+    except JWTError as exc:
+        logger.warning("local JWT decode failed: %s", exc)
 
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
 
