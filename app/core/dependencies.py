@@ -7,10 +7,41 @@ from app.core.supabase import get_supabase
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
-_JWT_SECRET = settings.SUPABASE_JWT_SECRET
-
 # Role hierarchy: higher index = more permissive override
 ROLE_HIERARCHY = ["readonly", "support", "finance", "operations", "super_admin"]
+
+
+def _verify_token(token: str) -> dict:
+    """
+    Verify a bearer token.
+
+    1. Try Supabase auth API (handles all real user JWTs regardless of secret encoding).
+    2. Fall back to local HS256 decode for service_role tokens used in backend tests.
+    """
+    # --- Primary: ask Supabase to validate the token ---
+    try:
+        sb = get_supabase()
+        resp = sb.auth.get_user(token)
+        if resp and resp.user:
+            return {"id": resp.user.id, "role": "authenticated"}
+    except Exception:
+        pass
+
+    # --- Fallback: local decode for service_role / internal tokens ---
+    try:
+        payload = jwt.decode(
+            token,
+            settings.SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            options={"verify_aud": False},
+        )
+        role = payload.get("role", "authenticated")
+        if role == "service_role":
+            return {"id": payload.get("sub"), "role": "service_role"}
+    except JWTError:
+        pass
+
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
 
 
 def get_current_user(
@@ -18,25 +49,7 @@ def get_current_user(
 ):
     if not credentials:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="No token provided")
-
-    token = credentials.credentials
-    try:
-        payload = jwt.decode(
-            token,
-            _JWT_SECRET,
-            algorithms=["HS256"],
-            options={"verify_aud": False},
-        )
-    except JWTError as e:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid token: {e}")
-
-    user_id = payload.get("sub")
-    role = payload.get("role", "authenticated")
-
-    if not user_id and role != "service_role":
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token missing sub")
-
-    return {"id": user_id, "role": role}
+    return _verify_token(credentials.credentials)
 
 
 def require_admin(user: dict = Depends(get_current_user)):
