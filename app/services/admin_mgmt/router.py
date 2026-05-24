@@ -287,6 +287,7 @@ def create_admin_user(body: CreateAdminBody, _user=Depends(require_admin)):
     try:
         sb.table("users").upsert({
             "id": new_user_id,
+            "supabase_uid": new_user_id,
             "email": body.email,
             "full_name": body.full_name,
             "phone_number": body.phone_number,

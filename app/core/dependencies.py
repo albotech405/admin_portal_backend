@@ -78,6 +78,16 @@ def require_admin(user: dict = Depends(get_current_user)):
             .execute()
         )
         row = result.data[0] if result.data else None
+        # Fallback: some admin rows were inserted with id = auth_uuid and no supabase_uid
+        if not row:
+            result2 = (
+                sb.table("users")
+                .select("id, is_admin, is_active, admin_role")
+                .eq("id", auth_id)
+                .limit(1)
+                .execute()
+            )
+            row = result2.data[0] if result2.data else None
     except Exception as exc:
         logger.error("Admin DB lookup failed: %s", exc)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error during admin check")
