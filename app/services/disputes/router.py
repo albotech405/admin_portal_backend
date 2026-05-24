@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Any, List
 from datetime import datetime, timezone
+from uuid import uuid4
 from app.core.dependencies import require_admin
 from app.core.supabase import get_supabase
 from app.services.notifications.router import send_push_to_users
@@ -284,6 +285,7 @@ def charge_driver_dispute(
 
         # Log transaction
         sb.table("wallet_transactions").insert({
+            "id": str(uuid4()),
             "driver_id": driver_id,
             "type": "debit",
             "amount": fee_amount,
