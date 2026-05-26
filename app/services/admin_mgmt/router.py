@@ -110,6 +110,34 @@ def _require_super_admin(user: dict, sb):
         raise HTTPException(status_code=403, detail="Super admin access required")
 
 
+def _invalidate_all_sessions(sb, admin_user_id: str) -> None:
+    """
+    Invalidate all active admin_sessions rows for admin_user_id and revoke
+    Supabase refresh tokens. Failures are non-fatal — the user account is
+    already disabled in the users table.
+    """
+    from app.core.supabase import revoke_user_sessions
+
+    now_str = datetime.now(timezone.utc).isoformat()
+    try:
+        sb.table("admin_sessions").update({
+            "is_active": False,
+            "logged_out_at": now_str,
+        }).eq("admin_id", admin_user_id).eq("is_active", True).execute()
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Failed to invalidate admin_sessions for %s: %s", admin_user_id, exc)
+
+    try:
+        uid_row = sb.table("users").select("supabase_uid").eq("id", admin_user_id).maybe_single().execute()
+        supabase_uid = uid_row.data.get("supabase_uid") if uid_row.data else None
+        if supabase_uid:
+            revoke_user_sessions(supabase_uid)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Failed to revoke Supabase sessions for %s: %s", admin_user_id, exc)
+
+
 # ── Admin profile (self) ──────────────────────────────────────────────────────
 
 @router.get("/me", response_model=AdminUserItem)
@@ -127,6 +155,7 @@ def record_admin_login(request: Request, _user=Depends(require_admin)):
     sb = get_supabase()
     now = datetime.now(timezone.utc).isoformat()
     ip = request.client.host if request.client else None
+    user_agent = request.headers.get("user-agent")
 
     try:
         # Update last_login_at on the user row
@@ -151,9 +180,6 @@ def record_admin_login(request: Request, _user=Depends(require_admin)):
             if not _in_allowlist(ip, allowed_ips):
                 raise HTTPException(status_code=403, detail="IP address not in allowlist")
 
-        # Create a session record (30-min expiry enforced at frontend; stored for audit)
-        from datetime import timedelta
-        expires_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
         session_id = str(uuid4())
         admin_email = None
         try:
@@ -165,15 +191,19 @@ def record_admin_login(request: Request, _user=Depends(require_admin)):
 
         sb.table("admin_sessions").insert({
             "id": session_id,
+            # Canonical columns (new schema)
+            "admin_id": _user["id"],
+            "logged_in_at": now,
+            "user_agent": user_agent,
+            # Legacy columns kept during migration window
             "admin_user_id": _user["id"],
             "admin_email": admin_email,
             "ip_address": ip,
             "created_at": now,
-            "expires_at": expires_at,
             "is_active": True,
         }).execute()
 
-        return {"session_id": session_id, "expires_at": expires_at}
+        return {"session_id": session_id}
     except HTTPException:
         raise
     except Exception as e:
@@ -182,13 +212,17 @@ def record_admin_login(request: Request, _user=Depends(require_admin)):
 
 @router.post("/me/invalidate-session")
 def invalidate_session(session_id: str = Query(...), _user=Depends(require_admin)):
-    """Mark a session as inactive (logout)."""
+    """Mark a session as inactive (logout). Idempotent — safe to call multiple times."""
     _require_user_id(_user)
     sb = get_supabase()
+    now_str = datetime.now(timezone.utc).isoformat()
     try:
-        sb.table("admin_sessions").update({"is_active": False}).eq("id", session_id).eq("admin_user_id", _user["id"]).execute()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        sb.table("admin_sessions").update({
+            "is_active": False,
+            "logged_out_at": now_str,
+        }).eq("id", session_id).eq("admin_id", _user["id"]).execute()
+    except Exception:
+        pass  # Idempotent: session may not exist or already be inactive
     return {"message": "Session invalidated"}
 
 
@@ -330,6 +364,10 @@ def update_admin_user(target_user_id: str, body: UpdateAdminBody, _user=Depends(
     if not result.data:
         raise HTTPException(status_code=404, detail="Admin user not found")
 
+    # When disabling an account, immediately invalidate all active sessions
+    if body.is_active is False:
+        _invalidate_all_sessions(sb, target_user_id)
+
     return {"message": "Admin user updated"}
 
 
@@ -353,6 +391,8 @@ def disable_admin_user(target_user_id: str, _user=Depends(require_admin)):
 
     if not result.data:
         raise HTTPException(status_code=404, detail="Admin user not found")
+
+    _invalidate_all_sessions(sb, target_user_id)
 
     return {"message": "Admin user disabled"}
 
