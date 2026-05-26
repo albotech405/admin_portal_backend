@@ -18,6 +18,8 @@ from app.services.sos.router import router as sos_router
 from app.services.support.router import router as support_router
 from app.services.admin_mgmt.router import router as admin_mgmt_router
 from app.services.users.router import router as users_router
+from app.services.ws.router import router as ws_router
+from app.services.admin_ui.router import router as admin_ui_router
 from app.core.scheduler import start_scheduler, stop_scheduler
 
 app = FastAPI(
@@ -90,6 +92,10 @@ app.include_router(support_router, prefix=settings.API_V1_PREFIX)
 app.include_router(admin_mgmt_router, prefix=settings.API_V1_PREFIX)
 app.include_router(users_router, prefix=settings.API_V1_PREFIX)
 app.include_router(admin_router, prefix=settings.API_V1_PREFIX)
+app.include_router(ws_router, prefix=settings.API_V1_PREFIX)
+
+# Admin UI pages — no /api/v1 prefix, served at /admin/...
+app.include_router(admin_ui_router)
 
 
 @app.get("/health")

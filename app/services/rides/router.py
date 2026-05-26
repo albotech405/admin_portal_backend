@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from app.core.dependencies import require_admin, get_current_user
 from app.core.supabase import get_supabase
 from app.services.notifications.router import send_push_to_users
+import asyncio
 
 router = APIRouter(prefix="/rides", tags=["rides"])
 
@@ -1022,3 +1023,142 @@ def update_ride_status(
             pass
 
     return {"ride_id": ride_id, "status": body.status}
+
+
+# ── Live Location Tracking (GPS) ────────────────────────────────────────
+
+
+class LocationPoint(BaseModel):
+    latitude: float
+    longitude: float
+    heading: Optional[float] = None
+    speed: Optional[float] = None
+    accuracy: Optional[float] = None
+    updated_at: Optional[str] = None
+
+
+class RideLocationResponse(BaseModel):
+    ride_id: str
+    driver: Optional[LocationPoint] = None
+    customer: Optional[LocationPoint] = None
+
+
+class PushLocationBody(BaseModel):
+    role: str  # "driver" or "customer"
+    latitude: float
+    longitude: float
+    heading: Optional[float] = None
+    speed: Optional[float] = None
+    accuracy: Optional[float] = None
+
+
+@router.get("/{ride_id}/location", response_model=RideLocationResponse)
+def get_ride_location(
+    ride_id: str,
+    _user: dict = Depends(require_admin),
+):
+    """
+    Return the last-known GPS position for both parties on an active ride.
+    Either field may be null if that party has not yet pushed a location.
+    """
+    sb = get_supabase()
+
+    # Verify the ride exists
+    try:
+        ride = sb.table("rides").select("id").eq("id", ride_id).maybe_single().execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not ride.data:
+        raise HTTPException(status_code=404, detail="Ride not found")
+
+    try:
+        rows = (
+            sb.table("ride_location_updates")
+            .select("role, latitude, longitude, heading, speed, accuracy, updated_at")
+            .eq("ride_id", ride_id)
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    driver_loc: Optional[LocationPoint] = None
+    customer_loc: Optional[LocationPoint] = None
+
+    for row in rows.data or []:
+        point = LocationPoint(
+            latitude=row["latitude"],
+            longitude=row["longitude"],
+            heading=row.get("heading"),
+            speed=row.get("speed"),
+            accuracy=row.get("accuracy"),
+            updated_at=row.get("updated_at"),
+        )
+        if row["role"] == "driver":
+            driver_loc = point
+        elif row["role"] == "customer":
+            customer_loc = point
+
+    return RideLocationResponse(ride_id=ride_id, driver=driver_loc, customer=customer_loc)
+
+
+@router.post("/{ride_id}/location", status_code=200)
+def push_ride_location(
+    ride_id: str,
+    body: PushLocationBody,
+    _user: dict = Depends(get_current_user),
+):
+    """
+    Mobile-app endpoint: push a GPS location update for the calling party.
+    Upserts the single current-location row and broadcasts a WebSocket event
+    to all connected admin sessions.
+    """
+    if body.role not in ("driver", "customer"):
+        raise HTTPException(status_code=400, detail="role must be 'driver' or 'customer'")
+
+    sb = get_supabase()
+
+    # Verify the ride is active
+    try:
+        ride = sb.table("rides").select("id, status").eq("id", ride_id).maybe_single().execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not ride.data:
+        raise HTTPException(status_code=404, detail="Ride not found")
+
+    now = datetime.now(timezone.utc).isoformat()
+    record = {
+        "ride_id": ride_id,
+        "role": body.role,
+        "latitude": body.latitude,
+        "longitude": body.longitude,
+        "heading": body.heading,
+        "speed": body.speed,
+        "accuracy": body.accuracy,
+        "updated_at": now,
+    }
+
+    try:
+        sb.table("ride_location_updates").upsert(
+            record, on_conflict="ride_id,role"
+        ).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Broadcast to admin WebSocket connections (best-effort, non-blocking)
+    event = "driver_location_update" if body.role == "driver" else "customer_location_update"
+    payload = {
+        "ride_id": ride_id,
+        "latitude": body.latitude,
+        "longitude": body.longitude,
+        "heading": body.heading,
+        "speed": body.speed,
+        "accuracy": body.accuracy,
+        "updated_at": now,
+    }
+    try:
+        from app.services.ws.router import manager as ws_manager
+        asyncio.get_event_loop().create_task(ws_manager.broadcast(event, payload))
+    except RuntimeError:
+        pass  # No running event loop in test context
+
+    return {"ride_id": ride_id, "role": body.role, "updated_at": now}

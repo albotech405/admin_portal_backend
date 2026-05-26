@@ -35,6 +35,10 @@ class Settings(BaseSettings):
 
     ALLOWED_ORIGINS: str = Field(default="http://localhost:3000,http://localhost:3001,http://localhost:5173")
 
+    # Publicly reachable base URL of this service (used to build tracking URLs).
+    # Override with the actual deployment URL in production, e.g. https://api.albotax.com
+    PUBLIC_BASE_URL: str = Field(default="http://localhost:8000")
+
     @property
     def cors_origins(self) -> List[str]:
         return [o.strip() for o in self.ALLOWED_ORIGINS.split(",")]
