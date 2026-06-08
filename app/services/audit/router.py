@@ -33,6 +33,13 @@ class AuditLogListResponse(BaseModel):
     total: int
 
 
+class AdminAuditWriteBody(BaseModel):
+    action: str
+    target_id: Optional[str] = None
+    target_table: Optional[str] = None
+    metadata: Optional[dict] = None
+
+
 # ── Helper used by other routers ───────────────────────────────────────────────
 
 def write_audit_log(
@@ -132,6 +139,26 @@ def get_audit_log(
         raise HTTPException(status_code=500, detail=str(e))
 
     return AuditLogListResponse(items=items, total=total)
+
+
+@router.post("/log")
+def write_admin_log(body: AdminAuditWriteBody, admin_user: dict = Depends(require_admin)):
+    sb = get_supabase()
+    try:
+        sb.table("admin_logs").insert({
+            "action": body.action,
+            "admin_id": admin_user.get("id"),
+            "target_id": body.target_id,
+            "target_table": body.target_table,
+            "metadata": {
+                **(body.metadata or {}),
+                "admin_role": admin_user.get("admin_role"),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        }).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "ok"}
 
 
 @router.get("/log/export")

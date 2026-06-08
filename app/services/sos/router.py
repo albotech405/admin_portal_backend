@@ -181,6 +181,12 @@ def trigger_sos(
     except RuntimeError:
         pass
 
+    try:
+        from app.services.live_location.router import emit_live_location_event
+        emit_live_location_event("session_started", sos_session_id=session_id)
+    except Exception:
+        pass
+
     return {
         "session_id": session_id,
         "tracking_url": tracking_url,
@@ -335,6 +341,12 @@ def resolve_sos_session(
     if not result.data:
         raise HTTPException(status_code=404, detail="SOS session not found")
 
+    try:
+        from app.services.live_location.router import emit_live_location_event
+        emit_live_location_event("session_manually_stopped", sos_session_id=session_id)
+    except Exception:
+        pass
+
     return {
         "message": "SOS session resolved",
         "session_id": session_id,
@@ -486,6 +498,12 @@ def push_sos_location(
         from app.services.ws.router import manager as ws_manager
         asyncio.get_event_loop().create_task(ws_manager.broadcast("sos_location_update", ws_payload))
     except RuntimeError:
+        pass
+
+    try:
+        from app.services.live_location.router import emit_live_location_event
+        emit_live_location_event("location_updated", sos_session_id=session_id)
+    except Exception:
         pass
 
     return {"session_id": session_id, "updated_at": now}

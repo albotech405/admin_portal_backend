@@ -1022,6 +1022,13 @@ def update_ride_status(
         except Exception:
             pass
 
+    if body.status in ("completed", "cancelled", "cancelled_by_driver", "cancelled_by_customer"):
+        try:
+            from app.services.live_location.router import emit_live_location_event
+            emit_live_location_event("session_ended", ride_id=ride_id)
+        except Exception:
+            pass
+
     return {"ride_id": ride_id, "status": body.status}
 
 
@@ -1160,5 +1167,11 @@ def push_ride_location(
         asyncio.get_event_loop().create_task(ws_manager.broadcast(event, payload))
     except RuntimeError:
         pass  # No running event loop in test context
+
+    try:
+        from app.services.live_location.router import emit_live_location_event
+        emit_live_location_event("location_updated", ride_id=ride_id)
+    except Exception:
+        pass
 
     return {"ride_id": ride_id, "role": body.role, "updated_at": now}

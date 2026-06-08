@@ -1,4 +1,4 @@
-from typing import Optional, List
+from typing import Optional, List, Sequence
 import logging
 import httpx
 from fastapi import Depends, HTTPException, status
@@ -62,12 +62,7 @@ def get_current_user(
     return _verify_token(credentials.credentials)
 
 
-def require_admin(user: dict = Depends(get_current_user)):
-    if user.get("role") == "service_role":
-        return user
-
-    # The auth UUID is stored in users.supabase_uid (users.id is the app-internal PK)
-    auth_id = user["id"]
+def _load_admin_row(auth_id: str) -> Optional[dict]:
     sb = get_supabase()
     try:
         result = (
@@ -92,15 +87,41 @@ def require_admin(user: dict = Depends(get_current_user)):
         logger.error("Admin DB lookup failed: %s", exc)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error during admin check")
 
+    return row
+
+
+def enforce_admin_access(user: dict, allowed_roles: Optional[Sequence[str]] = None) -> dict:
+    if user.get("role") == "service_role":
+        user.setdefault("admin_role", "super_admin")
+        return user
+
+    auth_id = user["id"]
+    row = _load_admin_row(auth_id)
+
     if not row or not row.get("is_admin"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
     if not row.get("is_active", True):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin account disabled")
 
+    role = row.get("admin_role")
+    if allowed_roles and role != "super_admin" and role not in allowed_roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Requires one of: {', '.join(allowed_roles)}",
+        )
+
     # Replace auth UUID with the internal users-table PK so downstream queries work
     user["id"] = row["id"]
-    user["admin_role"] = row.get("admin_role")
+    user["admin_role"] = role
     return user
+
+
+def resolve_admin_from_token(token: str, allowed_roles: Optional[Sequence[str]] = None) -> dict:
+    return enforce_admin_access(_verify_token(token), allowed_roles=allowed_roles)
+
+
+def require_admin(user: dict = Depends(get_current_user)):
+    return enforce_admin_access(user)
 
 
 def require_role(*allowed_roles: str):
@@ -113,16 +134,6 @@ def require_role(*allowed_roles: str):
         def endpoint(_user=Depends(require_role("finance", "super_admin"))):
     """
     def _dep(user: dict = Depends(require_admin)):
-        if user.get("role") == "service_role":
-            return user
-        role = user.get("admin_role")
-        if role == "super_admin":
-            return user
-        if role not in allowed_roles:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Requires one of: {', '.join(allowed_roles)}",
-            )
-        return user
+        return enforce_admin_access(user, allowed_roles=allowed_roles)
     return _dep
 
