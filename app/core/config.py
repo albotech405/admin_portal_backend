@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     SOS_NEARBY_DRIVER_RADIUS_KM: float = Field(default=5.0)
     SOS_NEARBY_DRIVER_ENABLED: bool = Field(default=True)
     SOS_RESPONSE_INSTRUCTIONS: str = Field(default="Open the driver app and follow the emergency assistance flow.")
+    SOS_STALE_AFTER_SECONDS: int = Field(default=120)
+    SOS_SHARE_DURATION_MINUTES: int = Field(default=60)
+    SOS_ALLOWED_SHARE_DURATIONS_MINUTES: str = Field(default="15,60,480")
+    SOS_ROUTE_HISTORY_LIMIT: int = Field(default=50)
 
     ALLOWED_ORIGINS: str = Field(default="http://localhost:3000,http://localhost:3001,http://localhost:5173")
     ADMIN_FRONTEND_ORIGINS: str = Field(default="")

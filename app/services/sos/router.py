@@ -6,7 +6,7 @@ import math
 import secrets
 import logging
 from typing import Any, Optional, List
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
@@ -115,6 +115,7 @@ class TriggerSosBody(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     triggered_by_driver: bool = False
+    share_duration_minutes: Optional[int] = None
 
 
 def _parse_dt(value: Any) -> Optional[datetime]:
@@ -175,6 +176,57 @@ def _session_tracking_url(session_row: dict[str, Any]) -> Optional[str]:
     if not token:
         return None
     return f"{settings.PUBLIC_BASE_URL}/api/v1/sos/track/{token}/map"
+
+
+def _allowed_share_durations_minutes() -> list[int]:
+    values: list[int] = []
+    for raw_value in settings.SOS_ALLOWED_SHARE_DURATIONS_MINUTES.split(","):
+        raw_value = raw_value.strip()
+        if not raw_value:
+            continue
+        try:
+            values.append(int(raw_value))
+        except ValueError:
+            continue
+    return values or [15, 60, 480]
+
+
+def _resolve_share_duration_minutes(value: Optional[int]) -> int:
+    requested = value or settings.SOS_SHARE_DURATION_MINUTES
+    allowed = _allowed_share_durations_minutes()
+    if requested not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"share_duration_minutes must be one of {allowed}",
+        )
+    return requested
+
+
+def _record_sos_location_history(
+    sb,
+    *,
+    session_id: str,
+    actor_user_id: Optional[str],
+    latitude: float,
+    longitude: float,
+    heading: Optional[float],
+    speed: Optional[float],
+    accuracy: Optional[float],
+    recorded_at: str,
+) -> None:
+    try:
+        sb.table("sos_location_updates").insert({
+            "sos_session_id": session_id,
+            "actor_user_id": actor_user_id,
+            "latitude": latitude,
+            "longitude": longitude,
+            "heading": heading,
+            "speed": speed,
+            "accuracy": accuracy,
+            "recorded_at": recorded_at,
+        }).execute()
+    except Exception as exc:
+        logger.warning("Failed to persist SOS route history for %s: %s", session_id, exc)
 
 
 def _query_users_by_ids(sb, user_ids: list[str]) -> dict[str, dict[str, Any]]:
@@ -658,6 +710,8 @@ def trigger_sos(
     user_id = (user_row or {}).get("id", auth_uid)
     user_name = (user_row or {}).get("full_name", "Unknown user")
     now = datetime.now(timezone.utc).isoformat()
+    share_duration_minutes = _resolve_share_duration_minutes(body.share_duration_minutes)
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=share_duration_minutes)).isoformat()
 
     session_id = str(uuid4())
     tracking_token = secrets.token_hex(16)
@@ -672,9 +726,24 @@ def trigger_sos(
             "last_longitude": body.longitude,
             "triggered_by_driver": body.triggered_by_driver,
             "tracking_token": tracking_token,
+            "expires_at": expires_at,
+            "last_location_update": now if body.latitude is not None and body.longitude is not None else None,
         }).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create SOS session: {e}")
+
+    if body.latitude is not None and body.longitude is not None:
+        _record_sos_location_history(
+            sb,
+            session_id=session_id,
+            actor_user_id=user_id,
+            latitude=body.latitude,
+            longitude=body.longitude,
+            heading=None,
+            speed=None,
+            accuracy=None,
+            recorded_at=now,
+        )
 
     try:
         session = _get_sos_session_item(
@@ -690,6 +759,8 @@ def trigger_sos(
                 "last_longitude": body.longitude,
                 "triggered_by_driver": body.triggered_by_driver,
                 "tracking_token": tracking_token,
+                "expires_at": expires_at,
+                "last_location_update": now if body.latitude is not None and body.longitude is not None else None,
             },
         )
         _send_admin_sos_notifications(sb, session)
@@ -1036,6 +1107,18 @@ def push_sos_location(
 
     if not result.data:
         raise HTTPException(status_code=404, detail="Active SOS session not found")
+
+    _record_sos_location_history(
+        sb,
+        session_id=session_id,
+        actor_user_id=_user.get("id"),
+        latitude=body.latitude,
+        longitude=body.longitude,
+        heading=body.heading,
+        speed=body.speed,
+        accuracy=body.accuracy,
+        recorded_at=now,
+    )
 
     # Broadcast to admin WebSocket connections (best-effort)
     ws_payload = {

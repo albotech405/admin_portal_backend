@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSock
 from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketState
 
+from app.core.config import settings
 from app.core.dependencies import require_role, resolve_admin_from_token
 from app.core.supabase import get_supabase
 
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 ACTIVE_RIDE_STATUSES = {"in_progress", "driver_en_route", "arrived"}
 ENDED_RIDE_STATUSES = {"completed", "cancelled", "cancelled_by_driver", "cancelled_by_customer"}
-DEFAULT_STALE_AFTER_SECONDS = 120
+DEFAULT_STALE_AFTER_SECONDS = settings.SOS_STALE_AFTER_SECONDS
 RIDE_SHARE_TTL_SECONDS = 45 * 60
 
 
@@ -373,6 +374,36 @@ def _query_sos_rows(active_only: bool, fetch_limit: int) -> List[dict[str, Any]]
     return query.execute().data or []
 
 
+def _query_sos_route_path(sos_session_id: str) -> List[CoordinatePoint]:
+    try:
+        rows = (
+            get_supabase()
+            .table("sos_location_updates")
+            .select("latitude, longitude, heading, speed, accuracy, recorded_at")
+            .eq("sos_session_id", sos_session_id)
+            .order("recorded_at", desc=True)
+            .limit(max(1, settings.SOS_ROUTE_HISTORY_LIMIT))
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        return []
+
+    return [
+        CoordinatePoint(
+            latitude=row.get("latitude"),
+            longitude=row.get("longitude"),
+            heading=row.get("heading"),
+            speed=row.get("speed"),
+            accuracy=row.get("accuracy"),
+            timestamp=_iso(row.get("recorded_at")),
+        )
+        for row in reversed(rows)
+        if row.get("latitude") is not None and row.get("longitude") is not None
+    ]
+
+
 def _query_rides_by_ids(ride_ids: List[str]) -> Dict[str, dict[str, Any]]:
     if not ride_ids:
         return {}
@@ -599,6 +630,7 @@ def _build_sos_session(
     driver_profiles_by_id: Dict[str, dict[str, Any]],
     driver_profiles_by_user_id: Dict[str, dict[str, Any]],
     users_by_id: Dict[str, dict[str, Any]],
+    route_path: Optional[List[CoordinatePoint]] = None,
 ) -> LiveLocationSession:
     now = datetime.now(timezone.utc)
     triggered_user_id = str(sos_row.get("user_id")) if sos_row.get("user_id") else None
@@ -734,6 +766,16 @@ def _build_sos_session(
         (linked_ride or {}).get("picking_point"),
         (linked_ride or {}).get("destination"),
     )
+    normalized_route_path = route_path or []
+    if not normalized_route_path and trigger_point:
+        normalized_route_path = [CoordinatePoint(
+            latitude=trigger_point.get("latitude"),
+            longitude=trigger_point.get("longitude"),
+            heading=trigger_point.get("heading"),
+            speed=trigger_point.get("speed"),
+            accuracy=trigger_point.get("accuracy"),
+            timestamp=trigger_point.get("timestamp"),
+        )]
     return LiveLocationSession(
         id=sos_row.get("id"),
         type="sos",
@@ -759,7 +801,7 @@ def _build_sos_session(
         pickup=_point_from_anchor((linked_ride or {}).get("picking_point")),
         destination=_point_from_anchor((linked_ride or {}).get("destination")),
         stops=_stops_from_payload((linked_ride or {}).get("stops")),
-        route_path=[],
+        route_path=normalized_route_path,
         last_location_timestamp=last_location_timestamp,
         waiting_for_first_update=trigger_point is None,
         end_reason="sos_resolved" if resolved_at else "sos_manually_stopped" if stopped_at else None,
@@ -803,6 +845,7 @@ def _collect_sessions(*, include_history: bool, type_filter: Optional[str], sear
                 driver_profiles_by_id,
                 driver_profiles_by_user_id,
                 users_by_id,
+                route_path=[],
             )
             if _matches_search(session, search):
                 sessions.append(session)
@@ -851,6 +894,7 @@ def _get_session_for_sos(sos_session_id: str) -> Optional[LiveLocationSession]:
                 driver_profiles_by_id,
                 driver_profiles_by_user_id,
                 users_by_id,
+                route_path=_query_sos_route_path(sos_session_id),
             )
     return None
 
