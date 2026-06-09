@@ -24,6 +24,10 @@ class CustomerAdminItem(BaseModel):
     total_customer_ratings: int = 0
     created_at: str
     updated_at: str
+    has_driver_profile: bool = False
+    linked_driver_id: Optional[str] = None
+    platform_roles: List[str] = Field(default_factory=lambda: ["customer"])
+    linked_driver: Optional[dict] = None
 
 
 class CustomerAdminListResponse(BaseModel):
@@ -74,6 +78,43 @@ _CUSTOMER_FIELDS = {
     "gender", "profile_image_url", "customer_rating", "total_customer_ratings",
     "created_at", "updated_at", "privacy_preferences",
 }
+
+
+def _build_driver_link_map(sb, user_ids: List[str]) -> dict[str, dict]:
+    if not user_ids:
+        return {}
+
+    result = (
+        sb.table("driver_profiles")
+        .select("id, user_id, verification_status")
+        .in_("user_id", user_ids)
+        .execute()
+    )
+    return {
+        str(row.get("user_id")): {
+            "linked_driver_id": str(row.get("id")),
+            "linked_driver": {
+                "id": str(row.get("id")),
+                "verification_status": row.get("verification_status"),
+            },
+        }
+        for row in (result.data or [])
+        if row.get("user_id") and row.get("id")
+    }
+
+
+def _customer_identity_fields(driver_link: Optional[dict]) -> dict:
+    has_driver_profile = bool(driver_link)
+    platform_roles = ["customer"]
+    if has_driver_profile:
+        platform_roles.append("driver")
+
+    return {
+        "has_driver_profile": has_driver_profile,
+        "linked_driver_id": driver_link.get("linked_driver_id") if driver_link else None,
+        "platform_roles": platform_roles,
+        "linked_driver": driver_link.get("linked_driver") if driver_link else None,
+    }
 
 
 @router.post(
@@ -191,10 +232,17 @@ def list_customers(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+    user_ids = [str(row.get("id")) for row in (result.data or []) if row.get("id")]
+    try:
+        driver_link_map = _build_driver_link_map(sb, user_ids)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
     customers = []
     for r in result.data or []:
         row_fields = {k: v for k, v in r.items() if k in _CUSTOMER_FIELDS}
-        customers.append(CustomerAdminItem(**row_fields))
+        identity_fields = _customer_identity_fields(driver_link_map.get(str(r.get("id"))))
+        customers.append(CustomerAdminItem(**row_fields, **identity_fields))
 
     return CustomerAdminListResponse(customers=customers, total=len(customers))
 
@@ -230,10 +278,16 @@ def get_customer_detail(user_id: str, _user=Depends(require_admin)):
         total_spent = 0.0
 
     row_fields = {k: v for k, v in r.items() if k in _CUSTOMER_FIELDS}
+    try:
+        driver_link_map = _build_driver_link_map(sb, [user_id])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
     return CustomerDetailResponse(
         **row_fields,
         total_rides=total_rides,
         total_spent=total_spent,
+        **_customer_identity_fields(driver_link_map.get(user_id)),
     )
 
 

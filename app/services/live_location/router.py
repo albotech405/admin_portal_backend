@@ -74,9 +74,11 @@ class LiveLocationSession(BaseModel):
     ride_id: Optional[str] = None
     sos_session_id: Optional[str] = None
     customer_id: Optional[str] = None
+    customer_user_id: Optional[str] = None
     customer_name: Optional[str] = None
     customer_phone: Optional[str] = None
     driver_id: Optional[str] = None
+    driver_user_id: Optional[str] = None
     driver_name: Optional[str] = None
     driver_phone: Optional[str] = None
     pickup: Optional[LocationAnchor] = None
@@ -181,8 +183,8 @@ def _parse_dt(value: Any) -> Optional[datetime]:
 def _iso(value: Any) -> Optional[str]:
     parsed = _parse_dt(value)
     if not parsed:
-        return value if isinstance(value, str) else None
-    return parsed.astimezone(timezone.utc).isoformat()
+        return None
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _add_seconds(value: Any, seconds: int) -> Optional[str]:
@@ -300,6 +302,7 @@ def _matches_history_filters(
 def _record_admin_log(
     admin_user: dict,
     *,
+    action: str = "live_location_view",
     entity_viewed: str,
     session_id: str,
     session_type: str,
@@ -311,7 +314,7 @@ def _record_admin_log(
     try:
         sb = get_supabase()
         sb.table("admin_logs").insert({
-            "action": "live_location_view",
+            "action": action,
             "admin_id": admin_user.get("id"),
             "target_id": session_id,
             "target_table": "live_location_sessions",
@@ -389,6 +392,51 @@ def _query_rides_by_ids(ride_ids: List[str]) -> Dict[str, dict[str, Any]]:
     return {row["id"]: row for row in rows}
 
 
+def _query_user_rows(user_ids: List[str]) -> Dict[str, dict[str, Any]]:
+    if not user_ids:
+        return {}
+    sb = get_supabase()
+    rows = (
+        sb.table("users")
+        .select("id, full_name, phone_number")
+        .in_("id", user_ids)
+        .execute()
+        .data
+        or []
+    )
+    return {str(row["id"]): row for row in rows if row.get("id")}
+
+
+def _query_driver_profiles(driver_ids: List[str]) -> Dict[str, dict[str, Any]]:
+    if not driver_ids:
+        return {}
+    sb = get_supabase()
+    rows = (
+        sb.table("driver_profiles")
+        .select("id, user_id")
+        .in_("id", driver_ids)
+        .execute()
+        .data
+        or []
+    )
+    return {str(row["id"]): row for row in rows if row.get("id")}
+
+
+def _query_driver_profiles_by_user_ids(user_ids: List[str]) -> Dict[str, dict[str, Any]]:
+    if not user_ids:
+        return {}
+    sb = get_supabase()
+    rows = (
+        sb.table("driver_profiles")
+        .select("id, user_id")
+        .in_("user_id", user_ids)
+        .execute()
+        .data
+        or []
+    )
+    return {str(row["user_id"]): row for row in rows if row.get("user_id")}
+
+
 def _participant_payload(
     *,
     participant_type: Literal["driver", "customer"],
@@ -440,7 +488,11 @@ def _participant_payload(
     )
 
 
-def _build_ride_session(ride: dict[str, Any], location_rows: Dict[str, dict[str, Any]]) -> LiveLocationSession:
+def _build_ride_session(
+    ride: dict[str, Any],
+    location_rows: Dict[str, dict[str, Any]],
+    driver_profiles_by_id: Dict[str, dict[str, Any]],
+) -> LiveLocationSession:
     now = datetime.now(timezone.utc)
     started_at = _iso(ride.get("started_at") or ride.get("created_at"))
     completed_at = _iso(ride.get("completed_at"))
@@ -504,6 +556,7 @@ def _build_ride_session(ride: dict[str, Any], location_rows: Dict[str, dict[str,
         )
 
     city, zone = _pick_city_zone(ride.get("picking_point"), ride.get("destination"))
+    driver_profile = driver_profiles_by_id.get(str(ride.get("driver_id"))) if ride.get("driver_id") else None
     return LiveLocationSession(
         id=f"ride:{ride['id']}",
         type="ride",
@@ -519,9 +572,11 @@ def _build_ride_session(ride: dict[str, Any], location_rows: Dict[str, dict[str,
         ride_id=ride.get("id"),
         sos_session_id=None,
         customer_id=ride.get("customer_id"),
+        customer_user_id=ride.get("customer_id"),
         customer_name=ride.get("customer_name"),
         customer_phone=ride.get("customer_phone"),
         driver_id=ride.get("driver_id"),
+        driver_user_id=(driver_profile or {}).get("user_id"),
         driver_name=ride.get("driver_name"),
         driver_phone=ride.get("driver_phone"),
         pickup=_point_from_anchor(ride.get("picking_point")),
@@ -537,14 +592,23 @@ def _build_ride_session(ride: dict[str, Any], location_rows: Dict[str, dict[str,
     )
 
 
-def _build_sos_session(sos_row: dict[str, Any], linked_ride: Optional[dict[str, Any]], ride_locations: Dict[str, dict[str, Any]]) -> LiveLocationSession:
+def _build_sos_session(
+    sos_row: dict[str, Any],
+    linked_ride: Optional[dict[str, Any]],
+    ride_locations: Dict[str, dict[str, Any]],
+    driver_profiles_by_id: Dict[str, dict[str, Any]],
+    driver_profiles_by_user_id: Dict[str, dict[str, Any]],
+    users_by_id: Dict[str, dict[str, Any]],
+) -> LiveLocationSession:
     now = datetime.now(timezone.utc)
-    user_info = sos_row.get("users") or {}
+    triggered_user_id = str(sos_row.get("user_id")) if sos_row.get("user_id") else None
+    user_info = users_by_id.get(triggered_user_id or "", {})
     started_at = _iso(sos_row.get("triggered_at"))
     expires_at = _iso(sos_row.get("expires_at"))
-    stopped_at = _iso(sos_row.get("cancelled_at"))
+    resolved_at = _iso(sos_row.get("resolved_at"))
+    stopped_at = _iso(sos_row.get("cancelled_at") or sos_row.get("resolved_at"))
     last_updated_at = _iso(sos_row.get("last_location_update"))
-    stop_reason = "sos_manually_stopped" if stopped_at else None
+    stop_reason = "sos_resolved" if resolved_at else "sos_manually_stopped" if stopped_at else None
 
     trigger_point = None
     if sos_row.get("last_latitude") is not None and sos_row.get("last_longitude") is not None:
@@ -557,12 +621,22 @@ def _build_sos_session(sos_row: dict[str, Any], linked_ride: Optional[dict[str, 
             "timestamp": last_updated_at,
         }
 
-    driver_name = linked_ride.get("driver_name") if linked_ride else None
-    driver_phone = linked_ride.get("driver_phone") if linked_ride else None
-    driver_id = linked_ride.get("driver_id") if linked_ride else None
-    customer_name = linked_ride.get("customer_name") if linked_ride else user_info.get("full_name")
-    customer_phone = linked_ride.get("customer_phone") if linked_ride else user_info.get("phone_number")
-    customer_id = linked_ride.get("customer_id") if linked_ride else sos_row.get("user_id")
+    ride_driver_id = linked_ride.get("driver_id") if linked_ride else None
+    driver_profile = driver_profiles_by_id.get(str(ride_driver_id)) if ride_driver_id else None
+    if driver_profile is None and triggered_user_id:
+        driver_profile = driver_profiles_by_user_id.get(triggered_user_id)
+
+    driver_user_id = str((driver_profile or {}).get("user_id")) if (driver_profile or {}).get("user_id") else (triggered_user_id if sos_row.get("triggered_by_driver") else None)
+    driver_user = users_by_id.get(driver_user_id or "", {})
+    customer_user_id = str(linked_ride.get("customer_id")) if linked_ride and linked_ride.get("customer_id") else (triggered_user_id if not sos_row.get("triggered_by_driver") else None)
+    customer_user = users_by_id.get(customer_user_id or "", {})
+
+    driver_name = (linked_ride.get("driver_name") if linked_ride else None) or driver_user.get("full_name") or (user_info.get("full_name") if sos_row.get("triggered_by_driver") else None)
+    driver_phone = (linked_ride.get("driver_phone") if linked_ride else None) or driver_user.get("phone_number") or (user_info.get("phone_number") if sos_row.get("triggered_by_driver") else None)
+    driver_id = str((driver_profile or {}).get("id")) if (driver_profile or {}).get("id") else (str(ride_driver_id) if ride_driver_id else None)
+    customer_name = (linked_ride.get("customer_name") if linked_ride else None) or customer_user.get("full_name") or (user_info.get("full_name") if not sos_row.get("triggered_by_driver") else None)
+    customer_phone = (linked_ride.get("customer_phone") if linked_ride else None) or customer_user.get("phone_number") or (user_info.get("phone_number") if not sos_row.get("triggered_by_driver") else None)
+    customer_id = customer_user_id
 
     driver_row = ride_locations.get("driver")
     customer_row = ride_locations.get("customer")
@@ -585,7 +659,7 @@ def _build_sos_session(sos_row: dict[str, Any], linked_ride: Optional[dict[str, 
             stale_after_seconds=DEFAULT_STALE_AFTER_SECONDS,
             now=now,
         )
-        if customer_row:
+        if customer_user_id or customer_name or customer_phone or customer_row:
             customer_participant = _participant_payload(
                 participant_type="customer",
                 source="manual_live_share",
@@ -617,7 +691,7 @@ def _build_sos_session(sos_row: dict[str, Any], linked_ride: Optional[dict[str, 
             stale_after_seconds=DEFAULT_STALE_AFTER_SECONDS,
             now=now,
         )
-        if driver_row:
+        if driver_user_id or driver_id or driver_name or driver_phone or driver_row:
             driver_participant = _participant_payload(
                 participant_type="driver",
                 source="trip_tracking",
@@ -634,14 +708,22 @@ def _build_sos_session(sos_row: dict[str, Any], linked_ride: Optional[dict[str, 
                 now=now,
             )
 
-    if not sos_row.get("is_active") and stopped_at:
+    last_location_timestamp = max(
+        [timestamp for timestamp in [last_updated_at, _iso((driver_row or {}).get("updated_at")), _iso((customer_row or {}).get("updated_at"))] if timestamp],
+        default=None,
+    )
+
+    if resolved_at:
+        status = "ended"
+        ended_at = stopped_at
+    elif not sos_row.get("is_active") and stopped_at:
         status = "manually_stopped"
         ended_at = stopped_at
     else:
         ended_at = None
         status = _derive_status(
             now=now,
-            last_updated_at=last_updated_at,
+            last_updated_at=last_location_timestamp,
             expires_at=expires_at,
             ended_at=ended_at,
             stopped_at=stopped_at,
@@ -667,18 +749,20 @@ def _build_sos_session(sos_row: dict[str, Any], linked_ride: Optional[dict[str, 
         ride_id=sos_row.get("ride_id"),
         sos_session_id=sos_row.get("id"),
         customer_id=customer_id,
+        customer_user_id=customer_user_id,
         customer_name=customer_name,
         customer_phone=customer_phone,
         driver_id=driver_id,
+        driver_user_id=driver_user_id,
         driver_name=driver_name,
         driver_phone=driver_phone,
         pickup=_point_from_anchor((linked_ride or {}).get("picking_point")),
         destination=_point_from_anchor((linked_ride or {}).get("destination")),
         stops=_stops_from_payload((linked_ride or {}).get("stops")),
         route_path=[],
-        last_location_timestamp=last_updated_at,
+        last_location_timestamp=last_location_timestamp,
         waiting_for_first_update=trigger_point is None,
-        end_reason="sos_resolved" if stopped_at else None,
+        end_reason="sos_resolved" if resolved_at else "sos_manually_stopped" if stopped_at else None,
         last_known_city=city,
         last_known_zone=zone,
         participants=SessionParticipants(driver=driver_participant, customer=customer_participant),
@@ -692,8 +776,9 @@ def _collect_sessions(*, include_history: bool, type_filter: Optional[str], sear
     if type_filter in (None, "ride"):
         ride_rows = _query_ride_rows(active_only=not include_history, fetch_limit=fetch_limit)
         ride_locations = _query_ride_location_rows([row["id"] for row in ride_rows])
+        driver_profiles_by_id = _query_driver_profiles([str(row.get("driver_id")) for row in ride_rows if row.get("driver_id")])
         for ride in ride_rows:
-            session = _build_ride_session(ride, ride_locations.get(ride["id"], {}))
+            session = _build_ride_session(ride, ride_locations.get(ride["id"], {}), driver_profiles_by_id)
             if _matches_search(session, search):
                 sessions.append(session)
 
@@ -701,9 +786,24 @@ def _collect_sessions(*, include_history: bool, type_filter: Optional[str], sear
         sos_rows = _query_sos_rows(active_only=not include_history, fetch_limit=fetch_limit)
         linked_rides = _query_rides_by_ids([row.get("ride_id") for row in sos_rows if row.get("ride_id")])
         ride_locations = _query_ride_location_rows(list(linked_rides.keys()))
+        driver_profiles_by_id = _query_driver_profiles([str(ride.get("driver_id")) for ride in linked_rides.values() if ride.get("driver_id")])
+        triggered_user_ids = [str(row.get("user_id")) for row in sos_rows if row.get("user_id")]
+        driver_profiles_by_user_id = _query_driver_profiles_by_user_ids(triggered_user_ids)
+        users_by_id = _query_user_rows(list({
+            *triggered_user_ids,
+            *[str(ride.get("customer_id")) for ride in linked_rides.values() if ride.get("customer_id")],
+            *[str(profile.get("user_id")) for profile in list(driver_profiles_by_id.values()) + list(driver_profiles_by_user_id.values()) if profile.get("user_id")],
+        }))
         for sos_row in sos_rows:
             ride_id = sos_row.get("ride_id")
-            session = _build_sos_session(sos_row, linked_rides.get(ride_id), ride_locations.get(ride_id, {}))
+            session = _build_sos_session(
+                sos_row,
+                linked_rides.get(ride_id),
+                ride_locations.get(ride_id, {}),
+                driver_profiles_by_id,
+                driver_profiles_by_user_id,
+                users_by_id,
+            )
             if _matches_search(session, search):
                 sessions.append(session)
 
@@ -725,7 +825,8 @@ def _get_session_for_ride(ride_id: str) -> Optional[LiveLocationSession]:
     if not ride_rows:
         return None
     locations = _query_ride_location_rows([ride_id])
-    return _build_ride_session(ride_rows[0], locations.get(ride_id, {}))
+    driver_profiles_by_id = _query_driver_profiles([str(ride_rows[0].get("driver_id"))] if ride_rows[0].get("driver_id") else [])
+    return _build_ride_session(ride_rows[0], locations.get(ride_id, {}), driver_profiles_by_id)
 
 
 def _get_session_for_sos(sos_session_id: str) -> Optional[LiveLocationSession]:
@@ -735,7 +836,22 @@ def _get_session_for_sos(sos_session_id: str) -> Optional[LiveLocationSession]:
             linked_rides = _query_rides_by_ids([row.get("ride_id")] if row.get("ride_id") else [])
             ride_id = row.get("ride_id")
             ride_locations = _query_ride_location_rows([ride_id] if ride_id else [])
-            return _build_sos_session(row, linked_rides.get(ride_id), ride_locations.get(ride_id, {}))
+            driver_profiles_by_id = _query_driver_profiles([str(linked_rides.get(ride_id).get("driver_id"))] if ride_id and linked_rides.get(ride_id) and linked_rides.get(ride_id).get("driver_id") else [])
+            triggered_user_id = str(row.get("user_id")) if row.get("user_id") else None
+            driver_profiles_by_user_id = _query_driver_profiles_by_user_ids([triggered_user_id] if triggered_user_id else [])
+            users_by_id = _query_user_rows(list({
+                *([triggered_user_id] if triggered_user_id else []),
+                *([str(linked_rides.get(ride_id).get("customer_id"))] if ride_id and linked_rides.get(ride_id) and linked_rides.get(ride_id).get("customer_id") else []),
+                *[str(profile.get("user_id")) for profile in list(driver_profiles_by_id.values()) + list(driver_profiles_by_user_id.values()) if profile.get("user_id")],
+            }))
+            return _build_sos_session(
+                row,
+                linked_rides.get(ride_id),
+                ride_locations.get(ride_id, {}),
+                driver_profiles_by_id,
+                driver_profiles_by_user_id,
+                users_by_id,
+            )
     return None
 
 
@@ -832,6 +948,7 @@ def get_live_location_session(
         raise HTTPException(status_code=404, detail="Live-location session not found")
     _record_admin_log(
         admin_user,
+        action="sos_live_location_view" if session.type == "sos" else "live_location_view",
         entity_viewed=f"{session.type}:{session.ride_id or session.sos_session_id}",
         session_id=session.id,
         session_type="trip_tracking" if session.type == "ride" else "sos_tracking",
@@ -875,6 +992,7 @@ def get_live_location_for_sos(
         raise HTTPException(status_code=404, detail="SOS live-location session not found")
     _record_admin_log(
         admin_user,
+        action="sos_live_location_view",
         entity_viewed=f"sos:{sos_session_id}",
         session_id=session.id,
         session_type="sos_tracking",

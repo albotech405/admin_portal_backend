@@ -53,6 +53,10 @@ class DriverAdminListItem(BaseModel):
     verification_feedback: Optional[str] = None
     is_suspended: bool = False
     created_at: str
+    has_customer_profile: bool = False
+    linked_customer_user_id: Optional[str] = None
+    platform_roles: List[str] = Field(default_factory=lambda: ["driver"])
+    linked_customer: Optional[dict] = None
     document_count: int = 0
     required_document_count: int = len(REQUIRED_DRIVER_DOCUMENT_TYPES)
     document_types_present: List[str] = Field(default_factory=list)
@@ -253,6 +257,48 @@ def _document_summary(document_rows: list[dict[str, Any]], supabase_client: Any)
     }
 
 
+def _load_customer_profile_user_ids(supabase_client: Any, user_ids: list[str]) -> set[str]:
+    if not user_ids:
+        return set()
+
+    try:
+        result = (
+            supabase_client.table("customer_profiles")
+            .select("user_id")
+            .in_("user_id", user_ids)
+            .execute()
+        )
+        return {str(row.get("user_id")) for row in (result.data or []) if row.get("user_id")}
+    except Exception:
+        return set()
+
+
+def _driver_identity_fields(user_id: Optional[str], user_info: dict[str, Any], customer_profile_user_ids: set[str]) -> dict[str, Any]:
+    linked_customer_user_id = str(user_id) if user_id else None
+    has_customer_profile = bool(
+        linked_customer_user_id and (
+            linked_customer_user_id in customer_profile_user_ids or user_info.get("role") == "customer"
+        )
+    )
+    platform_roles = ["driver"]
+    if has_customer_profile:
+        platform_roles.append("customer")
+
+    linked_customer = None
+    if has_customer_profile and linked_customer_user_id:
+        linked_customer = {
+            "id": linked_customer_user_id,
+            "status": "active" if user_info.get("is_active", True) else "suspended",
+        }
+
+    return {
+        "has_customer_profile": has_customer_profile,
+        "linked_customer_user_id": linked_customer_user_id if has_customer_profile else None,
+        "platform_roles": platform_roles,
+        "linked_customer": linked_customer,
+    }
+
+
 class DriverProfileFullResponse(DriverDetailResponse):
     """Full driver profile returned to both admin and driver-facing lookups.
     Includes verification_feedback so drivers can see the exact rejection reason."""
@@ -409,7 +455,7 @@ def list_drivers(
     try:
         sb = get_supabase()
         query = sb.table("driver_profiles").select(
-            "*, users(full_name, phone_number), driver_documents(*)"
+            "*, users(full_name, phone_number, role, is_active), driver_documents(*)"
         )
         if verification_status:
             query = query.eq("verification_status", verification_status)
@@ -417,17 +463,24 @@ def list_drivers(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+    customer_profile_user_ids = _load_customer_profile_user_ids(
+        sb,
+        [str(row.get("user_id")) for row in (result.data or []) if row.get("user_id")],
+    )
+
     drivers = []
     for r in result.data or []:
         user_info = r.pop("users", {}) or {}
         document_rows = r.pop("driver_documents", []) or []
         row_fields = {k: v for k, v in r.items() if k in _DRIVER_FIELDS}
         documents, document_summary = _document_summary(document_rows, sb)
+        identity_fields = _driver_identity_fields(r.get("user_id"), user_info, customer_profile_user_ids)
         drivers.append(DriverAdminListItem(
             **row_fields,
             full_name=user_info.get("full_name"),
             phone_number=user_info.get("phone_number"),
             total_trips=r.get("total_rides", 0) or 0,
+            **identity_fields,
             documents=documents,
             **document_summary,
         ))
@@ -442,7 +495,7 @@ def get_driver_by_user(user_id: str, _user=Depends(require_driver_document_acces
         sb = get_supabase()
         result = (
             sb.table("driver_profiles")
-            .select("*, users(full_name, phone_number), vehicle_details(*), driver_documents(*)")
+            .select("*, users(full_name, phone_number, role, is_active), vehicle_details(*), driver_documents(*)")
             .eq("user_id", user_id)
             .maybe_single()
             .execute()
@@ -461,6 +514,11 @@ def get_driver_by_user(user_id: str, _user=Depends(require_driver_document_acces
     document_rows = row.pop("driver_documents", []) or []
     base_fields = {k: v for k, v in row.items() if k in _DRIVER_FIELDS and k != "verification_feedback"}
     documents, document_summary = _document_summary(document_rows, sb)
+    identity_fields = _driver_identity_fields(
+        row.get("user_id"),
+        user_info,
+        _load_customer_profile_user_ids(sb, [str(row.get("user_id"))]) if row.get("user_id") else set(),
+    )
 
     write_audit_log(
         sb=sb,
@@ -481,6 +539,7 @@ def get_driver_by_user(user_id: str, _user=Depends(require_driver_document_acces
         full_name=user_info.get("full_name"),
         phone_number=user_info.get("phone_number"),
         total_trips=row.get("total_rides", 0) or 0,
+        **identity_fields,
         vehicle=VehicleDetailsResponse(**vehicle_data) if vehicle_data else None,
         documents=documents,
         **document_summary,
@@ -493,7 +552,7 @@ def get_driver_detail(driver_id: str, _user=Depends(require_driver_document_acce
         sb = get_supabase()
         result = (
             sb.table("driver_profiles")
-            .select("*, users(full_name, phone_number), vehicle_details(*), driver_documents(*)")
+            .select("*, users(full_name, phone_number, role, is_active), vehicle_details(*), driver_documents(*)")
             .eq("id", driver_id)
             .maybe_single()
             .execute()
@@ -512,6 +571,11 @@ def get_driver_detail(driver_id: str, _user=Depends(require_driver_document_acce
     document_rows = row.pop("driver_documents", []) or []
     base_fields = {k: v for k, v in row.items() if k in _DRIVER_FIELDS and k != "verification_feedback"}
     documents, document_summary = _document_summary(document_rows, sb)
+    identity_fields = _driver_identity_fields(
+        row.get("user_id"),
+        user_info,
+        _load_customer_profile_user_ids(sb, [str(row.get("user_id"))]) if row.get("user_id") else set(),
+    )
 
     write_audit_log(
         sb=sb,
@@ -532,6 +596,7 @@ def get_driver_detail(driver_id: str, _user=Depends(require_driver_document_acce
         full_name=user_info.get("full_name"),
         phone_number=user_info.get("phone_number"),
         total_trips=row.get("total_rides", 0) or 0,
+        **identity_fields,
         vehicle=VehicleDetailsResponse(**vehicle_data) if vehicle_data else None,
         documents=documents,
         **document_summary,
