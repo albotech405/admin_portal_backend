@@ -86,6 +86,7 @@ class LiveLocationSession(BaseModel):
     destination: Optional[LocationAnchor] = None
     stops: List[LocationAnchor] = Field(default_factory=list)
     route_path: List[CoordinatePoint] = Field(default_factory=list)
+    last_updated_at: Optional[str] = None
     last_location_timestamp: Optional[str] = None
     waiting_for_first_update: bool = False
     stream_error_code: Optional[str] = None
@@ -366,7 +367,12 @@ def _query_ride_location_rows(ride_ids: List[str]) -> Dict[str, Dict[str, dict[s
 
 def _query_sos_rows(active_only: bool, fetch_limit: int) -> List[dict[str, Any]]:
     sb = get_supabase()
-    query = sb.table("sos_sessions").select("*, users(full_name, phone_number)").order("triggered_at", desc=True).limit(fetch_limit)
+    query = (
+        sb.table("sos_sessions")
+        .select("*, users!sos_sessions_user_id_fkey(full_name, phone_number)")
+        .order("triggered_at", desc=True)
+        .limit(fetch_limit)
+    )
     if active_only:
         query = query.eq("is_active", True)
     else:
@@ -614,6 +620,7 @@ def _build_ride_session(
         destination=_point_from_anchor(ride.get("destination")),
         stops=_stops_from_payload(ride.get("stops")),
         route_path=[],
+        last_updated_at=last_location_timestamp,
         last_location_timestamp=last_location_timestamp,
         waiting_for_first_update=driver_participant is not None and driver_participant.waiting_for_first_update,
         end_reason=end_reason,
@@ -802,6 +809,7 @@ def _build_sos_session(
         destination=_point_from_anchor((linked_ride or {}).get("destination")),
         stops=_stops_from_payload((linked_ride or {}).get("stops")),
         route_path=normalized_route_path,
+        last_updated_at=last_location_timestamp,
         last_location_timestamp=last_location_timestamp,
         waiting_for_first_update=trigger_point is None,
         end_reason="sos_resolved" if resolved_at else "sos_manually_stopped" if stopped_at else None,

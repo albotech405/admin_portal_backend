@@ -115,13 +115,38 @@ def _is_missing_admin_id_column_error(exc: Exception) -> bool:
     return "admin_id" in message and ("schema cache" in message or "column" in message)
 
 
+_ADMIN_SESSION_MODERN_COLUMNS = {
+    "admin_id",
+    "logged_in_at",
+    "logged_out_at",
+    "user_agent",
+    "last_refreshed_at",
+}
+
+
+def _missing_admin_session_columns(exc: Exception) -> set[str]:
+    message = str(exc).lower()
+    if "schema cache" not in message and "column" not in message:
+        return set()
+    return {column for column in _ADMIN_SESSION_MODERN_COLUMNS if column in message}
+
+
+def _legacy_admin_session_payload(payload: dict, missing_columns: Optional[set[str]] = None) -> dict:
+    missing_columns = missing_columns or set()
+    legacy_payload = dict(payload)
+    for column in missing_columns or _ADMIN_SESSION_MODERN_COLUMNS:
+        legacy_payload.pop(column, None)
+    return legacy_payload
+
+
 def _insert_admin_session(sb, payload: dict) -> None:
     try:
         sb.table("admin_sessions").insert(payload).execute()
     except Exception as exc:
-        if not _is_missing_admin_id_column_error(exc):
+        missing_columns = _missing_admin_session_columns(exc)
+        if not missing_columns:
             raise
-        legacy_payload = {k: v for k, v in payload.items() if k != "admin_id"}
+        legacy_payload = _legacy_admin_session_payload(payload, missing_columns)
         sb.table("admin_sessions").insert(legacy_payload).execute()
 
 
@@ -134,9 +159,10 @@ def _update_admin_sessions_for_admin(sb, admin_user_id: str, updates: dict, *, s
     try:
         query.eq("admin_id", admin_user_id).execute()
     except Exception as exc:
-        if not _is_missing_admin_id_column_error(exc):
+        missing_columns = _missing_admin_session_columns(exc)
+        if not missing_columns:
             raise
-        fallback_query = sb.table("admin_sessions").update(updates)
+        fallback_query = sb.table("admin_sessions").update(_legacy_admin_session_payload(updates, missing_columns))
         if session_id:
             fallback_query = fallback_query.eq("id", session_id)
         if active_only:
