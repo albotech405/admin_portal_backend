@@ -1,4 +1,5 @@
 import re
+import logging
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Any
@@ -9,6 +10,7 @@ from app.core.supabase import get_supabase
 from app.services.audit.router import write_audit_log
 
 router = APIRouter(prefix="/customers", tags=["customers"])
+logger = logging.getLogger(__name__)
 
 
 class CustomerAdminItem(BaseModel):
@@ -375,7 +377,8 @@ def get_customer_emergency_contacts(user_id: str, _user=Depends(require_admin)):
             .execute()
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.warning("Failed to load emergency contacts for %s: %s", user_id, e)
+        return {"contacts": []}
 
     return {"contacts": result.data or []}
 

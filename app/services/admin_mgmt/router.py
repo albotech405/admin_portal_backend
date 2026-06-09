@@ -3,11 +3,13 @@ from pydantic import BaseModel, EmailStr
 from typing import Optional, List
 from datetime import datetime, timezone
 from uuid import uuid4
+import logging
 
 from app.core.dependencies import require_admin, get_current_user
 from app.core.supabase import get_supabase
 
 router = APIRouter(prefix="/admin/mgmt", tags=["admin-management"])
+logger = logging.getLogger(__name__)
 
 # ── Role constants ────────────────────────────────────────────────────────────
 
@@ -132,9 +134,9 @@ def _missing_admin_session_columns(exc: Exception) -> set[str]:
 
 
 def _legacy_admin_session_payload(payload: dict, missing_columns: Optional[set[str]] = None) -> dict:
-    missing_columns = missing_columns or set()
     legacy_payload = dict(payload)
-    for column in missing_columns or _ADMIN_SESSION_MODERN_COLUMNS:
+    columns_to_strip = _ADMIN_SESSION_MODERN_COLUMNS if missing_columns else _ADMIN_SESSION_MODERN_COLUMNS
+    for column in columns_to_strip:
         legacy_payload.pop(column, None)
     return legacy_payload
 
@@ -217,38 +219,45 @@ def record_admin_login(request: Request, _user=Depends(require_admin)):
     ip = request.client.host if request.client else None
     user_agent = request.headers.get("user-agent")
 
+    # Update last_login_at best-effort.
     try:
-        # Update last_login_at on the user row
         sb.table("users").update({"last_login_at": now}).eq("id", _user["id"]).execute()
+    except Exception as exc:
+        logger.warning("Failed to update last_login_at for %s: %s", _user["id"], exc)
 
-        # Check IP allowlist (if any entries exist, enforce it)
+    # Check IP allowlist (if any entries exist, enforce it).
+    try:
         allowlist_result = sb.table("admin_ip_allowlist").select("ip_cidr").execute()
         allowed_ips = [r["ip_cidr"] for r in (allowlist_result.data or [])]
-        if allowed_ips and ip and ip not in allowed_ips:
-            # Also check CIDR prefixes (simple prefix match for /24 etc.)
-            def _in_allowlist(client_ip: str, entries: list) -> bool:
-                for cidr in entries:
-                    if "/" not in cidr:
-                        if client_ip == cidr:
-                            return True
-                    else:
-                        prefix = cidr.split("/")[0].rsplit(".", 1)[0]
-                        if client_ip.startswith(prefix):
-                            return True
-                return False
+    except Exception as exc:
+        logger.warning("Failed to load admin IP allowlist: %s", exc)
+        allowed_ips = []
 
-            if not _in_allowlist(ip, allowed_ips):
-                raise HTTPException(status_code=403, detail="IP address not in allowlist")
+    if allowed_ips and ip and ip not in allowed_ips:
+        def _in_allowlist(client_ip: str, entries: list) -> bool:
+            for cidr in entries:
+                if "/" not in cidr:
+                    if client_ip == cidr:
+                        return True
+                else:
+                    prefix = cidr.split("/")[0].rsplit(".", 1)[0]
+                    if client_ip.startswith(prefix):
+                        return True
+            return False
 
-        session_id = str(uuid4())
-        admin_email = None
-        try:
-            ur = sb.table("users").select("email, admin_role").eq("id", _user["id"]).maybe_single().execute()
-            if ur.data:
-                admin_email = ur.data.get("email")
-        except Exception:
-            pass
+        if not _in_allowlist(ip, allowed_ips):
+            raise HTTPException(status_code=403, detail="IP address not in allowlist")
 
+    session_id = str(uuid4())
+    admin_email = None
+    try:
+        ur = sb.table("users").select("email, admin_role").eq("id", _user["id"]).maybe_single().execute()
+        if ur.data:
+            admin_email = ur.data.get("email")
+    except Exception as exc:
+        logger.warning("Failed to load admin email for session record %s: %s", _user["id"], exc)
+
+    try:
         _insert_admin_session(sb, {
             "id": session_id,
             # Canonical columns (new schema)
@@ -262,12 +271,11 @@ def record_admin_login(request: Request, _user=Depends(require_admin)):
             "created_at": now,
             "is_active": True,
         })
+    except Exception as exc:
+        logger.warning("Failed to record admin session for %s: %s", _user["id"], exc)
+        return {"session_id": None, "status": "degraded"}
 
-        return {"session_id": session_id}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"session_id": session_id, "status": "ok"}
 
 
 @router.post("/me/invalidate-session")

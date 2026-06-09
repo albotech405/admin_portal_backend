@@ -84,8 +84,8 @@ def _load_admin_row(auth_id: str) -> Optional[dict]:
             )
             row = result2.data[0] if result2.data else None
     except Exception as exc:
-        logger.error("Admin DB lookup failed: %s", exc)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error during admin check")
+        logger.error("Admin DB lookup failed for auth id %s: %s", auth_id, exc)
+        return None
 
     return row
 

@@ -5,11 +5,13 @@ from datetime import datetime, timezone
 from uuid import uuid4
 import csv
 import io
+import logging
 
 from app.core.dependencies import require_admin
 from app.core.supabase import get_supabase
 
 router = APIRouter(prefix="/admin/audit", tags=["audit"])
+logger = logging.getLogger(__name__)
 
 
 # ── Models ─────────────────────────────────────────────────────────────────────
@@ -157,7 +159,8 @@ def write_admin_log(body: AdminAuditWriteBody, admin_user: dict = Depends(requir
             },
         }).execute()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.warning("Admin audit write failed: %s", e)
+        return {"status": "unavailable"}
     return {"status": "ok"}
 
 
