@@ -16,6 +16,7 @@ class AdminNotification(BaseModel):
     content: str
     notification_type: str
     status: str
+    metadata: Optional[dict[str, Any]] = None
     read_at: Optional[str] = None
     created_at: str
 

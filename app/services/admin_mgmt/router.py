@@ -110,6 +110,40 @@ def _require_super_admin(user: dict, sb):
         raise HTTPException(status_code=403, detail="Super admin access required")
 
 
+def _is_missing_admin_id_column_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "admin_id" in message and ("schema cache" in message or "column" in message)
+
+
+def _insert_admin_session(sb, payload: dict) -> None:
+    try:
+        sb.table("admin_sessions").insert(payload).execute()
+    except Exception as exc:
+        if not _is_missing_admin_id_column_error(exc):
+            raise
+        legacy_payload = {k: v for k, v in payload.items() if k != "admin_id"}
+        sb.table("admin_sessions").insert(legacy_payload).execute()
+
+
+def _update_admin_sessions_for_admin(sb, admin_user_id: str, updates: dict, *, session_id: Optional[str] = None, active_only: bool = False) -> None:
+    query = sb.table("admin_sessions").update(updates)
+    if session_id:
+        query = query.eq("id", session_id)
+    if active_only:
+        query = query.eq("is_active", True)
+    try:
+        query.eq("admin_id", admin_user_id).execute()
+    except Exception as exc:
+        if not _is_missing_admin_id_column_error(exc):
+            raise
+        fallback_query = sb.table("admin_sessions").update(updates)
+        if session_id:
+            fallback_query = fallback_query.eq("id", session_id)
+        if active_only:
+            fallback_query = fallback_query.eq("is_active", True)
+        fallback_query.eq("admin_user_id", admin_user_id).execute()
+
+
 def _invalidate_all_sessions(sb, admin_user_id: str) -> None:
     """
     Invalidate all active admin_sessions rows for admin_user_id and revoke
@@ -120,10 +154,10 @@ def _invalidate_all_sessions(sb, admin_user_id: str) -> None:
 
     now_str = datetime.now(timezone.utc).isoformat()
     try:
-        sb.table("admin_sessions").update({
+        _update_admin_sessions_for_admin(sb, admin_user_id, {
             "is_active": False,
             "logged_out_at": now_str,
-        }).eq("admin_id", admin_user_id).eq("is_active", True).execute()
+        }, active_only=True)
     except Exception as exc:
         import logging
         logging.getLogger(__name__).warning("Failed to invalidate admin_sessions for %s: %s", admin_user_id, exc)
@@ -189,7 +223,7 @@ def record_admin_login(request: Request, _user=Depends(require_admin)):
         except Exception:
             pass
 
-        sb.table("admin_sessions").insert({
+        _insert_admin_session(sb, {
             "id": session_id,
             # Canonical columns (new schema)
             "admin_id": _user["id"],
@@ -201,7 +235,7 @@ def record_admin_login(request: Request, _user=Depends(require_admin)):
             "ip_address": ip,
             "created_at": now,
             "is_active": True,
-        }).execute()
+        })
 
         return {"session_id": session_id}
     except HTTPException:
@@ -217,10 +251,10 @@ def invalidate_session(session_id: str = Query(...), _user=Depends(require_admin
     sb = get_supabase()
     now_str = datetime.now(timezone.utc).isoformat()
     try:
-        sb.table("admin_sessions").update({
+        _update_admin_sessions_for_admin(sb, _user["id"], {
             "is_active": False,
             "logged_out_at": now_str,
-        }).eq("id", session_id).eq("admin_id", _user["id"]).execute()
+        }, session_id=session_id)
     except Exception:
         pass  # Idempotent: session may not exist or already be inactive
     return {"message": "Session invalidated"}

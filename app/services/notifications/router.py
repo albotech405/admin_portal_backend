@@ -14,6 +14,44 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _notifications_support_metadata(sb) -> bool:
+    try:
+        sb.table("notifications").select("metadata").limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
+def persist_notifications_for_users(
+    sb,
+    user_ids: List[str],
+    title: str,
+    body_text: str,
+    notification_type: str = "system",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    include_metadata = bool(metadata) and _notifications_support_metadata(sb)
+    rows = []
+    for uid in user_ids:
+        row = {
+            "id": str(uuid4()),
+            "user_id": uid,
+            "notification_type": notification_type,
+            "title": title,
+            "content": body_text,
+            "status": "unread",
+            "created_at": now,
+        }
+        if include_metadata:
+            row["metadata"] = metadata
+        rows.append(row)
+
+    chunk_size = 100
+    for i in range(0, len(rows), chunk_size):
+        sb.table("notifications").insert(rows[i: i + chunk_size]).execute()
+
+
 # ── Internal push helper (reused by other routers) ────────────────────────
 
 
@@ -62,6 +100,7 @@ def send_push_to_users(
     notification_type: str = "system",
     data: Optional[Dict[str, str]] = None,
     persist: bool = True,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, int]:
     """
     Send push notification to a list of internal user IDs.
@@ -88,23 +127,15 @@ def send_push_to_users(
             failed += len(all_tokens)
 
     if persist:
-        now = datetime.now(timezone.utc).isoformat()
-        rows = [
-            {
-                "id": str(uuid4()),
-                "user_id": uid,
-                "notification_type": notification_type,
-                "title": title,
-                "content": body,
-                "status": "unread",
-                "created_at": now,
-            }
-            for uid in user_ids
-        ]
-        chunk_size = 100
         try:
-            for i in range(0, len(rows), chunk_size):
-                sb.table("notifications").insert(rows[i: i + chunk_size]).execute()
+            persist_notifications_for_users(
+                sb,
+                user_ids,
+                title,
+                body,
+                notification_type=notification_type,
+                metadata=metadata,
+            )
         except Exception as exc:
             logger.warning("Failed to persist notifications: %s", exc)
 
@@ -218,22 +249,13 @@ def _persist_notifications(
     body_text: str,
     notification_type: str = "system",
 ):
-    now = datetime.now(timezone.utc).isoformat()
-    rows = [
-        {
-            "id": str(uuid4()),
-            "user_id": uid,
-            "notification_type": notification_type,
-            "title": title,
-            "content": body_text,
-            "status": "unread",
-            "created_at": now,
-        }
-        for uid in user_ids
-    ]
-    chunk_size = 100
-    for i in range(0, len(rows), chunk_size):
-        sb.table("notifications").insert(rows[i: i + chunk_size]).execute()
+    persist_notifications_for_users(
+        sb,
+        user_ids,
+        title,
+        body_text,
+        notification_type=notification_type,
+    )
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────

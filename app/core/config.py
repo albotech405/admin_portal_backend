@@ -5,6 +5,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Resolve .env relative to this file: backend/app/core/config.py -> backend/.env
 _ENV_FILE = Path(__file__).parent.parent.parent / ".env"
+_DEFAULT_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+    "http://127.0.0.1:5173",
+]
 
 
 class Settings(BaseSettings):
@@ -32,8 +40,13 @@ class Settings(BaseSettings):
     FIREBASE_PROJECT_ID: str = Field(default="")
 
     LOW_BALANCE_THRESHOLD: float = Field(default=500.0)
+    SOS_ADMIN_NOTIFICATION_ROLES: str = Field(default="operations,super_admin")
+    SOS_NEARBY_DRIVER_RADIUS_KM: float = Field(default=5.0)
+    SOS_NEARBY_DRIVER_ENABLED: bool = Field(default=True)
+    SOS_RESPONSE_INSTRUCTIONS: str = Field(default="Open the driver app and follow the emergency assistance flow.")
 
     ALLOWED_ORIGINS: str = Field(default="http://localhost:3000,http://localhost:3001,http://localhost:5173")
+    ADMIN_FRONTEND_ORIGINS: str = Field(default="")
 
     # Publicly reachable base URL of this service (used to build tracking URLs).
     # Override with the actual deployment URL in production, e.g. https://api.albotax.com
@@ -41,7 +54,16 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins(self) -> List[str]:
-        return [o.strip() for o in self.ALLOWED_ORIGINS.split(",")]
+        values = [*self.ALLOWED_ORIGINS.split(","), *self.ADMIN_FRONTEND_ORIGINS.split(",")]
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for raw_origin in [*_DEFAULT_CORS_ORIGINS, *values]:
+            origin = raw_origin.strip().rstrip("/")
+            if not origin or origin in seen:
+                continue
+            seen.add(origin)
+            normalized.append(origin)
+        return normalized
 
     model_config = SettingsConfigDict(env_file=str(_ENV_FILE), env_file_encoding="utf-8", extra="ignore")
 

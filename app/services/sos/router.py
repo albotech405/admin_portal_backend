@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import secrets
 import logging
 from typing import Any, Optional, List
@@ -71,6 +72,10 @@ class SosResponderItem(BaseModel):
     notified_at: Optional[str] = None
     responded: bool = False
     responded_at: Optional[str] = None
+    distance_to_incident_km: Optional[float] = None
+    delivery_status: Optional[str] = None
+    delivery_error: Optional[str] = None
+    metadata: Optional[dict] = None
 
 
 class SosSessionDetailResponse(SosSessionItem):
@@ -426,6 +431,202 @@ def _normalize_emergency_contacts(rows: list[dict[str, Any]]) -> list[EmergencyC
     return contacts
 
 
+def _haversine_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    radius_km = 6371.0
+    d_lat = math.radians(lat2 - lat1)
+    d_lon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(d_lat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(d_lon / 2) ** 2
+    )
+    return radius_km * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
+
+
+def _mask_phone(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    digits = "".join(ch for ch in str(value) if ch.isdigit())
+    if len(digits) <= 4:
+        return value
+    return f"***{digits[-4:]}"
+
+
+def _get_sos_admin_recipients(sb) -> list[str]:
+    allowed_roles = [role.strip() for role in settings.SOS_ADMIN_NOTIFICATION_ROLES.split(",") if role.strip()]
+    query = sb.table("users").select("id").eq("is_admin", True).eq("is_active", True)
+    if allowed_roles:
+        query = query.in_("admin_role", allowed_roles)
+    result = query.execute()
+    return [str(row.get("id")) for row in (result.data or []) if row.get("id")]
+
+
+def _driver_phone_for_notification(raw_phone: Optional[str]) -> Optional[str]:
+    return _mask_phone(raw_phone)
+
+
+def _query_nearby_eligible_drivers(
+    sb,
+    *,
+    latitude: float,
+    longitude: float,
+    exclude_driver_id: Optional[str],
+) -> list[dict[str, Any]]:
+    result = (
+        sb.table("driver_profiles")
+        .select("id, user_id, latitude, longitude, is_online, verification_status, users(full_name, phone_number)")
+        .eq("is_online", True)
+        .eq("verification_status", "approved")
+        .not_.is_("latitude", "null")
+        .not_.is_("longitude", "null")
+        .execute()
+    )
+
+    nearby: list[dict[str, Any]] = []
+    for row in result.data or []:
+        driver_id = str(row.get("id")) if row.get("id") else None
+        if not driver_id or (exclude_driver_id and driver_id == exclude_driver_id):
+            continue
+        try:
+            driver_lat = float(row.get("latitude"))
+            driver_lon = float(row.get("longitude"))
+        except (TypeError, ValueError):
+            continue
+        distance_km = _haversine_distance_km(latitude, longitude, driver_lat, driver_lon)
+        if distance_km > settings.SOS_NEARBY_DRIVER_RADIUS_KM:
+            continue
+        nearby.append({
+            **row,
+            "distance_to_incident_km": round(distance_km, 3),
+        })
+
+    nearby.sort(key=lambda row: row.get("distance_to_incident_km", 999999))
+    return nearby
+
+
+def _insert_sos_driver_alert_rows(sb, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    try:
+        sb.table("sos_driver_alerts").insert(rows).execute()
+    except Exception as exc:
+        message = str(exc).lower()
+        if "distance_to_incident_km" not in message and "delivery_status" not in message and "metadata" not in message:
+            raise
+        fallback_rows = [
+            {
+                key: value
+                for key, value in row.items()
+                if key in {"id", "sos_session_id", "driver_user_id", "notified_at", "responded", "responded_at"}
+            }
+            for row in rows
+        ]
+        sb.table("sos_driver_alerts").insert(fallback_rows).execute()
+
+
+def _send_admin_sos_notifications(sb, session: SosSessionItem) -> None:
+    admin_ids = _get_sos_admin_recipients(sb)
+    if not admin_ids:
+        return
+
+    metadata = {
+        "sos_session_id": session.id,
+        "ride_id": session.ride_id,
+        "customer_id": session.customer_user_id,
+        "customer_name": session.customer_name,
+        "customer_phone": session.customer_phone,
+        "driver_id": session.driver_id,
+        "driver_name": session.driver_name,
+        "driver_phone": session.driver_phone,
+        "latitude": session.latitude,
+        "longitude": session.longitude,
+        "location_name": session.location_name,
+        "address": session.address,
+        "alert_type": session.alert_type,
+        "alert_source": session.alert_source,
+        "created_at": session.created_at,
+        "deep_link": f"/safety?sosSessionId={session.id}",
+    }
+    push_data = {k: str(v) for k, v in metadata.items() if v is not None}
+    send_push_to_users(
+        admin_ids,
+        "SOS Alert",
+        session.message or "A new SOS alert requires attention.",
+        notification_type="sos_alert",
+        data=push_data,
+        persist=True,
+        metadata=metadata,
+    )
+
+
+def _notify_nearby_drivers(sb, session: SosSessionItem) -> None:
+    if not settings.SOS_NEARBY_DRIVER_ENABLED:
+        return
+    if session.latitude is None or session.longitude is None:
+        return
+
+    nearby_drivers = _query_nearby_eligible_drivers(
+        sb,
+        latitude=session.latitude,
+        longitude=session.longitude,
+        exclude_driver_id=session.driver_id,
+    )
+    if not nearby_drivers:
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    alert_rows: list[dict[str, Any]] = []
+    for driver in nearby_drivers:
+        driver_user_id = str(driver.get("user_id")) if driver.get("user_id") else None
+        if not driver_user_id:
+            continue
+
+        metadata = {
+            "sos_session_id": session.id,
+            "ride_id": session.ride_id,
+            "incident_latitude": session.latitude,
+            "incident_longitude": session.longitude,
+            "location_name": session.location_name,
+            "address": session.address,
+            "customer_name": session.customer_name,
+            "customer_phone": _mask_phone(session.customer_phone),
+            "associated_driver_name": session.driver_name,
+            "associated_driver_phone": _driver_phone_for_notification(session.driver_phone),
+            "alert_type": session.alert_type,
+            "alert_source": session.alert_source,
+            "created_at": session.created_at,
+            "distance_to_incident_km": driver.get("distance_to_incident_km"),
+            "response_instructions": settings.SOS_RESPONSE_INSTRUCTIONS,
+            "deep_link": f"/safety?sosSessionId={session.id}",
+        }
+        push_data = {k: str(v) for k, v in metadata.items() if v is not None}
+        counts = send_push_to_users(
+            [driver_user_id],
+            "Nearby SOS Alert",
+            f"Emergency assistance requested {driver.get('distance_to_incident_km', 0):.1f} km away.",
+            notification_type="nearby_sos_alert",
+            data=push_data,
+            persist=True,
+            metadata=metadata,
+        )
+        alert_rows.append({
+            "id": str(uuid4()),
+            "sos_session_id": session.id,
+            "driver_user_id": driver_user_id,
+            "notified_at": now,
+            "responded": False,
+            "responded_at": None,
+            "distance_to_incident_km": driver.get("distance_to_incident_km"),
+            "delivery_status": "sent" if counts.get("sent", 0) > 0 else "failed",
+            "delivery_error": None if counts.get("sent", 0) > 0 else "No reachable device token",
+            "metadata": metadata,
+        })
+
+    if alert_rows:
+        _insert_sos_driver_alert_rows(sb, alert_rows)
+
+
 @router.post("/trigger")
 def trigger_sos(
     body: TriggerSosBody,
@@ -475,21 +676,26 @@ def trigger_sos(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create SOS session: {e}")
 
-    # Notify all admin users via push notification
     try:
-        admin_result = sb.table("users").select("id").eq("is_admin", True).eq("is_active", True).execute()
-        admin_ids = [r["id"] for r in (admin_result.data or [])]
-        if admin_ids:
-            ride_info = f" on ride {body.ride_id}" if body.ride_id else ""
-            send_push_to_users(
-                admin_ids,
-                "SOS Alert",
-                f"SOS triggered by {user_name}{ride_info}. Immediate attention required.",
-                notification_type="system",
-                persist=True,
-            )
+        session = _get_sos_session_item(
+            sb,
+            {
+                "id": session_id,
+                "user_id": user_id,
+                "is_active": True,
+                "triggered_at": now,
+                "created_at": now,
+                "ride_id": body.ride_id,
+                "last_latitude": body.latitude,
+                "last_longitude": body.longitude,
+                "triggered_by_driver": body.triggered_by_driver,
+                "tracking_token": tracking_token,
+            },
+        )
+        _send_admin_sos_notifications(sb, session)
+        _notify_nearby_drivers(sb, session)
     except Exception:
-        pass
+        logger.exception("Failed to send SOS alert notifications for session %s", session_id)
 
     # Broadcast to admin WebSocket connections (best-effort)
     tracking_url = f"{settings.PUBLIC_BASE_URL}/api/v1/sos/track/{tracking_token}/map"
@@ -619,6 +825,10 @@ def get_sos_session_detail(session_id: str, _user=Depends(require_sos_access)):
                 notified_at=_iso_or_none(resp.get("notified_at")),
                 responded=resp.get("responded", False),
                 responded_at=_iso_or_none(resp.get("responded_at")),
+                distance_to_incident_km=_as_float(resp.get("distance_to_incident_km")),
+                delivery_status=_clean_text(resp.get("delivery_status")),
+                delivery_error=_clean_text(resp.get("delivery_error")),
+                metadata=_dictish(resp.get("metadata")) or None,
             ))
     except Exception:
         pass
@@ -743,6 +953,10 @@ def get_sos_responders(session_id: str, _user=Depends(require_sos_access)):
             notified_at=_iso_or_none(resp.get("notified_at")),
             responded=resp.get("responded", False),
             responded_at=_iso_or_none(resp.get("responded_at")),
+            distance_to_incident_km=_as_float(resp.get("distance_to_incident_km")),
+            delivery_status=_clean_text(resp.get("delivery_status")),
+            delivery_error=_clean_text(resp.get("delivery_error")),
+            metadata=_dictish(resp.get("metadata")) or None,
         ))
 
     return SosResponderListResponse(
