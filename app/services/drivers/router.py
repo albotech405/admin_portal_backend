@@ -1,15 +1,38 @@
+import mimetypes
 import re
+from pathlib import PurePosixPath
+from urllib.parse import urlparse
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional, List
+from typing import Any, Optional, List
 from datetime import date, datetime, timezone
 from uuid import uuid4
 from app.core.dependencies import require_admin, require_role
+from app.core.config import settings
 from app.core.supabase import call_rpc, first_row, get_supabase
 from app.services.notifications.router import send_push_to_users
 from app.services.audit.router import write_audit_log
 
 router = APIRouter(prefix="/drivers", tags=["drivers"])
+
+
+DRIVER_DOCUMENT_BUCKET = "driver-documents"
+DRIVER_DOCUMENT_URL_TTL_SECONDS = 60 * 60
+KYC_DOCUMENT_ALLOWED_ROLES = ("operations", "super_admin")
+REQUIRED_DRIVER_DOCUMENT_TYPES = [
+    "national_id",
+    "selfie_with_id",
+    "drivers_license",
+    "vehicle_registration",
+    "insurance",
+    "profile_photo",
+    "vehicle_photo_front",
+    "vehicle_photo_back",
+    "vehicle_photo_left",
+    "vehicle_photo_right",
+]
+require_driver_document_access = require_role(*KYC_DOCUMENT_ALLOWED_ROLES)
 
 
 class DriverAdminListItem(BaseModel):
@@ -30,6 +53,12 @@ class DriverAdminListItem(BaseModel):
     verification_feedback: Optional[str] = None
     is_suspended: bool = False
     created_at: str
+    document_count: int = 0
+    required_document_count: int = len(REQUIRED_DRIVER_DOCUMENT_TYPES)
+    document_types_present: List[str] = Field(default_factory=list)
+    missing_document_types: List[str] = Field(default_factory=list)
+    document_access_error: Optional[str] = None
+    documents: List["DriverDocumentResponse"] = Field(default_factory=list)
 
 
 class VehicleDetailsResponse(BaseModel):
@@ -48,13 +77,180 @@ class VehicleDetailsResponse(BaseModel):
 class DriverDocumentResponse(BaseModel):
     id: str
     document_type: str
-    file_url: str
+    file_url: Optional[str] = None
+    open_url: Optional[str] = None
+    download_url: Optional[str] = None
+    file_name: Optional[str] = None
+    mime_type: Optional[str] = None
+    file_extension: Optional[str] = None
+    uploaded_at: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    storage_status: str = "available"
     status: str
 
 
 class DriverDetailResponse(DriverAdminListItem):
     vehicle: Optional[VehicleDetailsResponse] = None
-    documents: List[DriverDocumentResponse] = []
+
+
+def _to_iso8601(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return str(value)
+
+
+def _is_absolute_url(value: Optional[str]) -> bool:
+    return bool(value and value.startswith(("http://", "https://")))
+
+
+def _guess_mime_type(file_name: Optional[str], fallback: Optional[str]) -> Optional[str]:
+    if fallback:
+        return fallback
+    if not file_name:
+        return None
+    guessed, _ = mimetypes.guess_type(file_name)
+    return guessed
+
+
+def _normalize_storage_path(document_row: dict[str, Any]) -> Optional[str]:
+    for key in ("storage_path", "file_path", "path", "object_path", "storage_key", "file_url"):
+        raw_value = document_row.get(key)
+        if not raw_value or _is_absolute_url(raw_value):
+            continue
+        path = str(raw_value).strip().lstrip("/")
+        if not path:
+            continue
+        prefixes = (
+            f"{DRIVER_DOCUMENT_BUCKET}/",
+            f"public/{DRIVER_DOCUMENT_BUCKET}/",
+            f"sign/{DRIVER_DOCUMENT_BUCKET}/",
+            f"object/public/{DRIVER_DOCUMENT_BUCKET}/",
+            f"object/sign/{DRIVER_DOCUMENT_BUCKET}/",
+        )
+        for prefix in prefixes:
+            if path.startswith(prefix):
+                return path[len(prefix):]
+        return path
+    return None
+
+
+def _extract_file_name(document_row: dict[str, Any], storage_path: Optional[str]) -> Optional[str]:
+    for key in ("file_name", "filename", "original_file_name", "original_filename", "name"):
+        value = document_row.get(key)
+        if value:
+            return str(value)
+    raw_url = document_row.get("file_url")
+    if _is_absolute_url(raw_url):
+        path = urlparse(str(raw_url)).path
+        if path:
+            return PurePosixPath(path).name or None
+    if storage_path:
+        return PurePosixPath(storage_path).name or None
+    return None
+
+
+def _resolve_signed_url(supabase_client: Any, storage_path: str) -> Optional[str]:
+    response = supabase_client.storage.from_(DRIVER_DOCUMENT_BUCKET).create_signed_url(
+        storage_path,
+        DRIVER_DOCUMENT_URL_TTL_SECONDS,
+    )
+    if isinstance(response, str):
+        signed_url = response
+    else:
+        signed_url = response.get("signedURL") or response.get("signedUrl") or response.get("signed_url")
+    if not signed_url:
+        return None
+    if signed_url.startswith(("http://", "https://")):
+        return signed_url
+    if signed_url.startswith("/storage/v1/"):
+        return f"{settings.SUPABASE_URL.rstrip('/')}{signed_url}"
+    return f"{settings.SUPABASE_URL.rstrip('/')}/storage/v1/{signed_url.lstrip('/')}"
+
+
+def _build_document_response(document_row: dict[str, Any], supabase_client: Any) -> DriverDocumentResponse:
+    raw_file_url = document_row.get("file_url")
+    storage_path = _normalize_storage_path(document_row)
+    file_name = _extract_file_name(document_row, storage_path)
+    mime_type = _guess_mime_type(file_name, document_row.get("mime_type"))
+    file_extension = document_row.get("file_extension")
+    if not file_extension and file_name and "." in file_name:
+        file_extension = file_name.rsplit(".", 1)[-1].lower()
+
+    file_url = raw_file_url if _is_absolute_url(raw_file_url) else None
+    storage_status = "available"
+    if not file_url and storage_path:
+        try:
+            file_url = _resolve_signed_url(supabase_client, storage_path)
+            if not file_url:
+                storage_status = "missing"
+        except Exception as exc:
+            error_text = str(exc).lower()
+            storage_status = "missing" if "not found" in error_text or "no such" in error_text else "unavailable"
+    elif not file_url:
+        storage_status = "missing"
+
+    return DriverDocumentResponse(
+        id=str(document_row.get("id", "")),
+        document_type=str(document_row.get("document_type", "unknown")),
+        status=str(document_row.get("status", "pending")),
+        file_url=file_url,
+        open_url=file_url,
+        download_url=file_url,
+        file_name=file_name,
+        mime_type=mime_type,
+        file_extension=str(file_extension) if file_extension is not None else None,
+        uploaded_at=_to_iso8601(document_row.get("uploaded_at") or document_row.get("created_at")),
+        rejection_reason=document_row.get("rejection_reason"),
+        storage_status=storage_status,
+    )
+
+
+def _build_document_payload(document_rows: list[dict[str, Any]], supabase_client: Any) -> tuple[list[DriverDocumentResponse], Optional[str]]:
+    documents: list[DriverDocumentResponse] = []
+    access_error: Optional[str] = None
+    for row in document_rows or []:
+        try:
+            documents.append(_build_document_response(row, supabase_client))
+        except Exception as exc:
+            access_error = "One or more documents could not be prepared for admin viewing."
+            documents.append(
+                DriverDocumentResponse(
+                    id=str(row.get("id", "")),
+                    document_type=str(row.get("document_type", "unknown")),
+                    status=str(row.get("status", "pending")),
+                    file_name=_extract_file_name(row, _normalize_storage_path(row)),
+                    mime_type=row.get("mime_type"),
+                    file_extension=row.get("file_extension"),
+                    uploaded_at=_to_iso8601(row.get("uploaded_at") or row.get("created_at")),
+                    rejection_reason=row.get("rejection_reason"),
+                    storage_status="unavailable",
+                )
+            )
+    return documents, access_error
+
+
+def _document_summary(document_rows: list[dict[str, Any]], supabase_client: Any) -> tuple[list[DriverDocumentResponse], dict[str, Any]]:
+    documents, access_error = _build_document_payload(document_rows, supabase_client)
+    present_types: list[str] = []
+    seen_types: set[str] = set()
+    for document in documents:
+        document_type = document.document_type
+        if document_type and document_type not in seen_types:
+            seen_types.add(document_type)
+            present_types.append(document_type)
+
+    missing_types = [doc_type for doc_type in REQUIRED_DRIVER_DOCUMENT_TYPES if doc_type not in seen_types]
+    return documents, {
+        "document_count": len(documents),
+        "required_document_count": len(REQUIRED_DRIVER_DOCUMENT_TYPES),
+        "document_types_present": present_types,
+        "missing_document_types": missing_types,
+        "document_access_error": access_error,
+    }
 
 
 class DriverProfileFullResponse(DriverDetailResponse):
@@ -208,12 +404,12 @@ def create_driver(body: CreateDriverRequest, _user: dict = Depends(require_role(
 @router.get("/admin/list", response_model=DriverAdminListResponse)
 def list_drivers(
     verification_status: Optional[str] = Query(None),
-    _user=Depends(require_admin),
+    _user=Depends(require_driver_document_access),
 ):
     try:
         sb = get_supabase()
         query = sb.table("driver_profiles").select(
-            "*, users(full_name, phone_number)"
+            "*, users(full_name, phone_number), driver_documents(*)"
         )
         if verification_status:
             query = query.eq("verification_status", verification_status)
@@ -224,19 +420,23 @@ def list_drivers(
     drivers = []
     for r in result.data or []:
         user_info = r.pop("users", {}) or {}
+        document_rows = r.pop("driver_documents", []) or []
         row_fields = {k: v for k, v in r.items() if k in _DRIVER_FIELDS}
+        documents, document_summary = _document_summary(document_rows, sb)
         drivers.append(DriverAdminListItem(
             **row_fields,
             full_name=user_info.get("full_name"),
             phone_number=user_info.get("phone_number"),
             total_trips=r.get("total_rides", 0) or 0,
+            documents=documents,
+            **document_summary,
         ))
 
     return DriverAdminListResponse(drivers=drivers, total=len(drivers))
 
 
 @router.get("/by-user/{user_id}", response_model=DriverProfileFullResponse)
-def get_driver_by_user(user_id: str, _user=Depends(require_admin)):
+def get_driver_by_user(user_id: str, _user=Depends(require_driver_document_access)):
     """Fetch a driver's full profile by their user_id (auth uid)."""
     try:
         sb = get_supabase()
@@ -258,8 +458,22 @@ def get_driver_by_user(user_id: str, _user=Depends(require_admin)):
     vehicle_data = row.pop("vehicle_details", None)
     if isinstance(vehicle_data, list):
         vehicle_data = vehicle_data[0] if vehicle_data else None
-    documents = row.pop("driver_documents", []) or []
+    document_rows = row.pop("driver_documents", []) or []
     base_fields = {k: v for k, v in row.items() if k in _DRIVER_FIELDS and k != "verification_feedback"}
+    documents, document_summary = _document_summary(document_rows, sb)
+
+    write_audit_log(
+        sb=sb,
+        admin_user=_user,
+        action_type="driver_documents_viewed",
+        entity_type="driver_profiles",
+        entity_id=str(row.get("id")),
+        summary=f"Admin viewed driver documents for user {user_id}",
+        after_state={
+            "document_count": document_summary["document_count"],
+            "signed_url_ttl_seconds": DRIVER_DOCUMENT_URL_TTL_SECONDS,
+        },
+    )
 
     return DriverProfileFullResponse(
         **base_fields,
@@ -268,12 +482,13 @@ def get_driver_by_user(user_id: str, _user=Depends(require_admin)):
         phone_number=user_info.get("phone_number"),
         total_trips=row.get("total_rides", 0) or 0,
         vehicle=VehicleDetailsResponse(**vehicle_data) if vehicle_data else None,
-        documents=[DriverDocumentResponse(**doc) for doc in documents],
+        documents=documents,
+        **document_summary,
     )
 
 
 @router.get("/{driver_id}", response_model=DriverProfileFullResponse)
-def get_driver_detail(driver_id: str, _user=Depends(require_admin)):
+def get_driver_detail(driver_id: str, _user=Depends(require_driver_document_access)):
     try:
         sb = get_supabase()
         result = (
@@ -294,8 +509,22 @@ def get_driver_detail(driver_id: str, _user=Depends(require_admin)):
     vehicle_data = row.pop("vehicle_details", None)
     if isinstance(vehicle_data, list):
         vehicle_data = vehicle_data[0] if vehicle_data else None
-    documents = row.pop("driver_documents", []) or []
+    document_rows = row.pop("driver_documents", []) or []
     base_fields = {k: v for k, v in row.items() if k in _DRIVER_FIELDS and k != "verification_feedback"}
+    documents, document_summary = _document_summary(document_rows, sb)
+
+    write_audit_log(
+        sb=sb,
+        admin_user=_user,
+        action_type="driver_documents_viewed",
+        entity_type="driver_profiles",
+        entity_id=driver_id,
+        summary=f"Admin viewed driver documents for driver {driver_id}",
+        after_state={
+            "document_count": document_summary["document_count"],
+            "signed_url_ttl_seconds": DRIVER_DOCUMENT_URL_TTL_SECONDS,
+        },
+    )
 
     return DriverProfileFullResponse(
         **base_fields,
@@ -304,7 +533,8 @@ def get_driver_detail(driver_id: str, _user=Depends(require_admin)):
         phone_number=user_info.get("phone_number"),
         total_trips=row.get("total_rides", 0) or 0,
         vehicle=VehicleDetailsResponse(**vehicle_data) if vehicle_data else None,
-        documents=[DriverDocumentResponse(**doc) for doc in documents],
+        documents=documents,
+        **document_summary,
     )
 
 
@@ -490,7 +720,7 @@ class DocumentRejectBody(BaseModel):
 
 
 @router.patch("/{driver_id}/documents/{document_id}/approve")
-def approve_driver_document(driver_id: str, document_id: str, _user=Depends(require_admin)):
+def approve_driver_document(driver_id: str, document_id: str, _user=Depends(require_driver_document_access)):
     """Approve an individual driver document."""
     try:
         sb = get_supabase()
@@ -509,7 +739,7 @@ def approve_driver_document(driver_id: str, document_id: str, _user=Depends(requ
 
 
 @router.patch("/{driver_id}/documents/{document_id}/reject")
-def reject_driver_document(driver_id: str, document_id: str, body: DocumentRejectBody, _user=Depends(require_admin)):
+def reject_driver_document(driver_id: str, document_id: str, body: DocumentRejectBody, _user=Depends(require_driver_document_access)):
     """Reject an individual driver document with a reason."""
     try:
         sb = get_supabase()
@@ -623,7 +853,7 @@ def get_driver_ratings(
 
 
 @router.get("/{driver_id}/compliance")
-def get_driver_compliance(driver_id: str, _user=Depends(require_admin)):
+def get_driver_compliance(driver_id: str, _user=Depends(require_driver_document_access)):
     try:
         sb = get_supabase()
         docs = sb.table("driver_documents").select("*").eq("driver_id", driver_id).execute()
@@ -636,11 +866,13 @@ def get_driver_compliance(driver_id: str, _user=Depends(require_admin)):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    documents, document_summary = _document_summary(docs.data or [], sb)
     return {
-        "documents": docs.data or [],
+        "documents": [document.model_dump() for document in documents],
         "license_number": (profile.data or {}).get("license_number"),
         "license_expiry": (profile.data or {}).get("license_expiry"),
         "verification_status": (profile.data or {}).get("verification_status"),
+        **document_summary,
     }
 
 
