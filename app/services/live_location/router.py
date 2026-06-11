@@ -222,6 +222,32 @@ def _pick_city_zone(*values: Any) -> tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+def _mapping_or_empty(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _build_sos_trigger_point(sos_row: dict[str, Any], timestamp: Optional[str]) -> Optional[dict[str, Any]]:
+    latitude = sos_row.get("last_latitude")
+    longitude = sos_row.get("last_longitude")
+
+    if latitude is None:
+        latitude = sos_row.get("latitude")
+    if longitude is None:
+        longitude = sos_row.get("longitude")
+
+    if latitude is None or longitude is None:
+        return None
+
+    return {
+        "latitude": latitude,
+        "longitude": longitude,
+        "heading": sos_row.get("last_heading") or sos_row.get("heading"),
+        "speed": sos_row.get("speed"),
+        "accuracy": sos_row.get("accuracy"),
+        "timestamp": timestamp,
+    }
+
+
 def _derive_status(
     *,
     now: datetime,
@@ -641,44 +667,37 @@ def _build_sos_session(
 ) -> LiveLocationSession:
     now = datetime.now(timezone.utc)
     triggered_user_id = str(sos_row.get("user_id")) if sos_row.get("user_id") else None
-    user_info = users_by_id.get(triggered_user_id or "", {})
+    linked_ride = _mapping_or_empty(linked_ride)
+    user_info = _mapping_or_empty(users_by_id.get(triggered_user_id or ""))
     started_at = _iso(sos_row.get("triggered_at"))
     expires_at = _iso(sos_row.get("expires_at"))
     resolved_at = _iso(sos_row.get("resolved_at"))
     stopped_at = _iso(sos_row.get("cancelled_at") or sos_row.get("resolved_at"))
-    last_updated_at = _iso(sos_row.get("last_location_update"))
+    last_updated_at = _iso(sos_row.get("last_location_update") or sos_row.get("last_location_timestamp"))
     stop_reason = "sos_resolved" if resolved_at else "sos_manually_stopped" if stopped_at else None
 
-    trigger_point = None
-    if sos_row.get("last_latitude") is not None and sos_row.get("last_longitude") is not None:
-        trigger_point = {
-            "latitude": sos_row.get("last_latitude"),
-            "longitude": sos_row.get("last_longitude"),
-            "heading": sos_row.get("last_heading"),
-            "speed": None,
-            "accuracy": None,
-            "timestamp": last_updated_at,
-        }
+    trigger_point = _build_sos_trigger_point(sos_row, last_updated_at)
 
-    ride_driver_id = linked_ride.get("driver_id") if linked_ride else None
+    ride_driver_id = linked_ride.get("driver_id")
     driver_profile = driver_profiles_by_id.get(str(ride_driver_id)) if ride_driver_id else None
     if driver_profile is None and triggered_user_id:
         driver_profile = driver_profiles_by_user_id.get(triggered_user_id)
+    driver_profile = _mapping_or_empty(driver_profile)
 
-    driver_user_id = str((driver_profile or {}).get("user_id")) if (driver_profile or {}).get("user_id") else (triggered_user_id if sos_row.get("triggered_by_driver") else None)
-    driver_user = users_by_id.get(driver_user_id or "", {})
-    customer_user_id = str(linked_ride.get("customer_id")) if linked_ride and linked_ride.get("customer_id") else (triggered_user_id if not sos_row.get("triggered_by_driver") else None)
-    customer_user = users_by_id.get(customer_user_id or "", {})
+    driver_user_id = str(driver_profile.get("user_id")) if driver_profile.get("user_id") else (triggered_user_id if sos_row.get("triggered_by_driver") else None)
+    driver_user = _mapping_or_empty(users_by_id.get(driver_user_id or ""))
+    customer_user_id = str(linked_ride.get("customer_id")) if linked_ride.get("customer_id") else (triggered_user_id if not sos_row.get("triggered_by_driver") else None)
+    customer_user = _mapping_or_empty(users_by_id.get(customer_user_id or ""))
 
-    driver_name = (linked_ride.get("driver_name") if linked_ride else None) or driver_user.get("full_name") or (user_info.get("full_name") if sos_row.get("triggered_by_driver") else None)
-    driver_phone = (linked_ride.get("driver_phone") if linked_ride else None) or driver_user.get("phone_number") or (user_info.get("phone_number") if sos_row.get("triggered_by_driver") else None)
-    driver_id = str((driver_profile or {}).get("id")) if (driver_profile or {}).get("id") else (str(ride_driver_id) if ride_driver_id else None)
-    customer_name = (linked_ride.get("customer_name") if linked_ride else None) or customer_user.get("full_name") or (user_info.get("full_name") if not sos_row.get("triggered_by_driver") else None)
-    customer_phone = (linked_ride.get("customer_phone") if linked_ride else None) or customer_user.get("phone_number") or (user_info.get("phone_number") if not sos_row.get("triggered_by_driver") else None)
+    driver_name = linked_ride.get("driver_name") or driver_user.get("full_name") or (user_info.get("full_name") if sos_row.get("triggered_by_driver") else None)
+    driver_phone = linked_ride.get("driver_phone") or driver_user.get("phone_number") or (user_info.get("phone_number") if sos_row.get("triggered_by_driver") else None)
+    driver_id = str(driver_profile.get("id")) if driver_profile.get("id") else (str(ride_driver_id) if ride_driver_id else None)
+    customer_name = linked_ride.get("customer_name") or customer_user.get("full_name") or (user_info.get("full_name") if not sos_row.get("triggered_by_driver") else None)
+    customer_phone = linked_ride.get("customer_phone") or customer_user.get("phone_number") or (user_info.get("phone_number") if not sos_row.get("triggered_by_driver") else None)
     customer_id = customer_user_id
 
-    driver_row = ride_locations.get("driver")
-    customer_row = ride_locations.get("customer")
+    driver_row = _mapping_or_empty(ride_locations.get("driver"))
+    customer_row = _mapping_or_empty(ride_locations.get("customer"))
     driver_participant = None
     customer_participant = None
 
@@ -710,7 +729,7 @@ def _build_sos_session(
                 stop_reason=stop_reason,
                 ended_at=None if sos_row.get("is_active") else stopped_at,
                 last_updated_at=_iso(customer_row.get("updated_at")),
-                point_row=customer_row,
+                point_row=customer_row or None,
                 stale_after_seconds=DEFAULT_STALE_AFTER_SECONDS,
                 now=now,
             )
@@ -742,7 +761,7 @@ def _build_sos_session(
                 stop_reason=stop_reason,
                 ended_at=None if sos_row.get("is_active") else stopped_at,
                 last_updated_at=_iso(driver_row.get("updated_at")),
-                point_row=driver_row,
+                point_row=driver_row or None,
                 stale_after_seconds=DEFAULT_STALE_AFTER_SECONDS,
                 now=now,
             )
@@ -770,8 +789,8 @@ def _build_sos_session(
         )
 
     city, zone = _pick_city_zone(
-        (linked_ride or {}).get("picking_point"),
-        (linked_ride or {}).get("destination"),
+        linked_ride.get("picking_point"),
+        linked_ride.get("destination"),
     )
     normalized_route_path = route_path or []
     if not normalized_route_path and trigger_point:
@@ -805,9 +824,9 @@ def _build_sos_session(
         driver_user_id=driver_user_id,
         driver_name=driver_name,
         driver_phone=driver_phone,
-        pickup=_point_from_anchor((linked_ride or {}).get("picking_point")),
-        destination=_point_from_anchor((linked_ride or {}).get("destination")),
-        stops=_stops_from_payload((linked_ride or {}).get("stops")),
+        pickup=_point_from_anchor(linked_ride.get("picking_point")),
+        destination=_point_from_anchor(linked_ride.get("destination")),
+        stops=_stops_from_payload(linked_ride.get("stops")),
         route_path=normalized_route_path,
         last_updated_at=last_location_timestamp,
         last_location_timestamp=last_location_timestamp,
@@ -1038,8 +1057,14 @@ def get_live_location_for_sos(
     sos_session_id: str,
     source_surface: Optional[Literal["dashboard", "ride_detail", "sos_detail", "search_history"]] = Query(None),
     admin_user: dict = Depends(require_role("operations")),
-):
-    session = _get_session_for_sos(sos_session_id)
+ ) -> LiveLocationSession:
+    try:
+        session = _get_session_for_sos(sos_session_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to build SOS live-location session for %s", sos_session_id)
+        raise HTTPException(status_code=500, detail="Unable to load SOS live-location session") from exc
     if not session:
         raise HTTPException(status_code=404, detail="SOS live-location session not found")
     _record_admin_log(
