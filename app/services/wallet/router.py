@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional, List
 from app.core.dependencies import require_admin
-from app.core.supabase import call_rpc, first_row, get_supabase
+from app.core.supabase import call_rpc, first_row, get_supabase, rpc_error_to_http_exception
 
 router = APIRouter(prefix="/wallet", tags=["wallet"])
 
@@ -100,7 +100,7 @@ def approve_topup(request_id: str, _user=Depends(require_admin)):
             )
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise rpc_error_to_http_exception(e)
 
     if not result:
         raise HTTPException(status_code=404, detail="Request not found")
@@ -126,7 +126,7 @@ def reject_topup(request_id: str, body: Optional[RejectBody] = None, _user=Depen
             )
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise rpc_error_to_http_exception(e)
 
     if not result:
         raise HTTPException(status_code=404, detail="Request not found")

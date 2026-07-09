@@ -2,6 +2,7 @@ import logging
 from typing import Any, Optional
 
 import httpx
+from fastapi import HTTPException
 from supabase import create_client, Client
 
 from app.core.config import settings
@@ -50,6 +51,20 @@ def revoke_user_sessions(supabase_uid: str) -> None:
 def call_rpc(function_name: str, params: dict[str, Any]) -> Any:
     response = get_supabase().rpc(function_name, params).execute()
     return response.data
+
+
+def rpc_error_to_http_exception(exc: Exception) -> HTTPException:
+    message = str(exc)
+    lower_message = message.lower()
+
+    if "admin access required" in lower_message:
+        return HTTPException(status_code=403, detail="Admin access required")
+    if "admin_id is required" in lower_message:
+        return HTTPException(status_code=400, detail="admin_id is required")
+    if "permission denied" in lower_message:
+        return HTTPException(status_code=403, detail=message)
+
+    return HTTPException(status_code=500, detail=message)
 
 
 def first_row(data: Any) -> Any:

@@ -10,7 +10,7 @@ from datetime import date, datetime, timezone
 from uuid import uuid4
 from app.core.dependencies import require_admin, require_role
 from app.core.config import settings
-from app.core.supabase import call_rpc, first_row, get_supabase
+from app.core.supabase import call_rpc, first_row, get_supabase, rpc_error_to_http_exception
 from app.services.notifications.router import send_push_to_users
 from app.services.audit.router import write_audit_log
 
@@ -614,7 +614,7 @@ def activate_driver(driver_id: str, _user=Depends(require_admin)):
             call_rpc("approve_driver", {"p_driver_id": driver_id, "p_admin_id": admin_id})
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise rpc_error_to_http_exception(e)
     if not result:
         raise HTTPException(status_code=404, detail="Driver not found")
     return result
@@ -642,7 +642,7 @@ def deactivate_driver(
             )
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise rpc_error_to_http_exception(e)
     if not result:
         raise HTTPException(status_code=404, detail="Driver not found")
     return result
@@ -664,7 +664,7 @@ def reject_driver(driver_id: str, body: RejectDriverBody, _user=Depends(require_
             call_rpc("reject_driver", {"p_driver_id": driver_id, "p_reason": reason, "p_admin_id": admin_id})
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise rpc_error_to_http_exception(e)
     if not result:
         raise HTTPException(status_code=404, detail="Driver not found")
     return result
@@ -689,7 +689,7 @@ def suspend_driver(driver_id: str, body: SuspendDriverBody, _user=Depends(requir
             )
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise rpc_error_to_http_exception(e)
     if not result:
         raise HTTPException(status_code=404, detail="Driver not found")
 
@@ -719,7 +719,7 @@ def unsuspend_driver(driver_id: str, _user=Depends(require_admin)):
             call_rpc("approve_driver", {"p_driver_id": driver_id, "p_admin_id": admin_id})
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise rpc_error_to_http_exception(e)
     if not result:
         raise HTTPException(status_code=404, detail="Driver not found")
 
@@ -755,7 +755,7 @@ def block_driver(driver_id: str, _user=Depends(require_admin)):
             )
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise rpc_error_to_http_exception(e)
     if not result:
         raise HTTPException(status_code=404, detail="Driver not found")
     return result
