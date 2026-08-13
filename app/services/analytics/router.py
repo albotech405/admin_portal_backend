@@ -2,10 +2,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from typing import List, Optional, Any
 from app.core.dependencies import require_admin
-from app.core.supabase import get_supabase
+from app.core.supabase import get_supabase, count_of, IN_FILTER_CHUNK as _IN_FILTER_CHUNK
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor
+import logging
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
+
+logger = logging.getLogger(__name__)
 
 
 class DashboardMetricsResponse(BaseModel):
@@ -53,70 +57,50 @@ def get_dashboard_metrics(_user=Depends(require_admin)):
         sb = get_supabase()
         metrics = DashboardMetricsResponse()
 
-        # 1. Pending payments count
-        try:
-            payments = (
+        # Each tile below is an independent count. They use head=True so PostgREST
+        # returns only the count in the Content-Range header instead of shipping every
+        # matching row back for len() to count — that made the endpoint slow down in
+        # proportion to table size. They are also run concurrently, since the cost here
+        # is round-trip latency to Supabase, not local work.
+
+        def pending_payments() -> int:
+            return count_of(
                 sb.table("wallet_topup_requests")
-                .select("id", count="exact")
+                .select("id", count="exact", head=True)
                 .eq("status", "pending")
-                .execute()
             )
-            metrics.pending_payments_count = len(payments.data or [])
-        except Exception:
-            pass
 
-        # 2. Pending drivers count
-        try:
-            drivers = (
+        def pending_drivers() -> int:
+            return count_of(
                 sb.table("driver_profiles")
-                .select("id", count="exact")
+                .select("id", count="exact", head=True)
                 .eq("verification_status", "pending")
-                .execute()
             )
-            metrics.pending_drivers_count = len(drivers.data or [])
-        except Exception:
-            pass
 
-        # 3. Active drivers (approved + online)
-        try:
-            active_drivers = (
+        def active_drivers() -> int:
+            return count_of(
                 sb.table("driver_profiles")
-                .select("id", count="exact")
+                .select("id", count="exact", head=True)
                 .eq("verification_status", "approved")
                 .eq("is_online", True)
-                .execute()
             )
-            metrics.active_drivers_count = len(active_drivers.data or [])
-        except Exception:
-            pass
 
-        # 4. Active rides (in_progress + driver_en_route + arrived)
-        try:
-            active_statuses = ["in_progress", "driver_en_route", "arrived"]
-            active_rides = (
+        def active_rides() -> int:
+            return count_of(
                 sb.table("rides")
-                .select("id", count="exact")
-                .in_("status", active_statuses)
-                .execute()
+                .select("id", count="exact", head=True)
+                .in_("status", ["in_progress", "driver_en_route", "arrived"])
             )
-            metrics.active_rides_count = len(active_rides.data or [])
-        except Exception:
-            pass
 
-        # 5. Active SOS sessions
-        try:
-            active_sos = (
+        def active_sos() -> int:
+            return count_of(
                 sb.table("sos_sessions")
-                .select("id", count="exact")
+                .select("id", count="exact", head=True)
                 .eq("is_active", True)
-                .execute()
             )
-            metrics.active_sos_count = len(active_sos.data or [])
-        except Exception:
-            pass
 
-        # 6. Stale ride requests (pending > threshold with 0 bids)
-        try:
+        def stale_requests() -> int:
+            """Pending requests older than the alert threshold that have drawn no bids."""
             stale_threshold_minutes = 10  # default
             try:
                 config_result = (
@@ -132,33 +116,55 @@ def get_dashboard_metrics(_user=Depends(require_admin)):
                 pass
 
             cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_threshold_minutes)
-            cutoff_str = cutoff.isoformat()
 
-            pending_requests = (
+            pending = (
                 sb.table("ride_requests")
-                .select("id, created_at")
+                .select("id")
                 .eq("status", "pending")
-                .lt("created_at", cutoff_str)
+                .lt("created_at", cutoff.isoformat())
                 .execute()
             )
+            pending_ids = [r["id"] for r in (pending.data or []) if r.get("id")]
+            if not pending_ids:
+                return 0
 
-            stale_count = 0
-            for req in pending_requests.data or []:
+            # One bulk lookup of "which of these got a bid" instead of a query per
+            # request. Chunked so the ?in=(...) filter cannot overflow the URL length.
+            bid_on: set = set()
+            for i in range(0, len(pending_ids), _IN_FILTER_CHUNK):
+                chunk = pending_ids[i : i + _IN_FILTER_CHUNK]
+                responses = (
+                    sb.table("driver_responses")
+                    .select("ride_request_id")
+                    .in_("ride_request_id", chunk)
+                    .execute()
+                )
+                bid_on.update(
+                    r["ride_request_id"]
+                    for r in (responses.data or [])
+                    if r.get("ride_request_id")
+                )
+
+            return sum(1 for rid in pending_ids if rid not in bid_on)
+
+        tiles = {
+            "pending_payments_count": pending_payments,
+            "pending_drivers_count": pending_drivers,
+            "active_drivers_count": active_drivers,
+            "active_rides_count": active_rides,
+            "active_sos_count": active_sos,
+            "stale_requests_count": stale_requests,
+        }
+
+        with ThreadPoolExecutor(max_workers=len(tiles)) as pool:
+            futures = {field: pool.submit(fn) for field, fn in tiles.items()}
+            for field, future in futures.items():
                 try:
-                    bids = (
-                        sb.table("driver_responses")
-                        .select("id", count="exact")
-                        .eq("ride_request_id", req.get("id"))
-                        .execute()
-                    )
-                    if len(bids.data or []) == 0:
-                        stale_count += 1
+                    setattr(metrics, field, future.result())
                 except Exception:
-                    stale_count += 1
-
-            metrics.stale_requests_count = stale_count
-        except Exception:
-            pass
+                    # A single unavailable tile must not blank the whole dashboard;
+                    # it keeps the response model's default.
+                    logger.exception("dashboard metric %s failed", field)
 
         return metrics
 
@@ -196,6 +202,25 @@ def get_offer_update_metrics(_user=Depends(require_admin)):
         total_updates = 0
         driver_update_map = {}  # driver_id -> {"total_offers": 0, "updated_offers": 0, "name": "", "phone": ""}
 
+        # A driver's offer list does not vary between their own rides, so fetch it once
+        # per driver rather than once per ride. Previously a driver with N completed
+        # rides triggered N identical queries; the accumulation below is unchanged.
+        offers_by_driver: dict = {}
+
+        def offers_for(driver_id) -> list:
+            if driver_id not in offers_by_driver:
+                try:
+                    offers = (
+                        sb.table("driver_responses")
+                        .select("id, created_at, status")
+                        .eq("driver_id", driver_id)
+                        .execute()
+                    )
+                    offers_by_driver[driver_id] = list(offers.data or [])
+                except Exception:
+                    offers_by_driver[driver_id] = []
+            return offers_by_driver[driver_id]
+
         for ride in completed_rides.data or []:
             driver_id = ride.get("driver_id")
             if driver_id and driver_id not in driver_update_map:
@@ -206,19 +231,7 @@ def get_offer_update_metrics(_user=Depends(require_admin)):
                     "phone_number": None,
                 }
 
-            # Count offers for this ride's request
-            # We approximate by counting driver_responses from this driver
-            try:
-                offers = (
-                    sb.table("driver_responses")
-                    .select("id, created_at, status")
-                    .eq("driver_id", driver_id)
-                    .execute()
-                )
-            except Exception:
-                offers = type("obj", (object,), {"data": []})()
-
-            driver_offers = [o for o in (offers.data or [])]
+            driver_offers = offers_for(driver_id)
             if driver_id in driver_update_map:
                 driver_update_map[driver_id]["total_offers"] += len(driver_offers)
 

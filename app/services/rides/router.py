@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import Optional, Any, List
 from datetime import datetime, timezone
 from app.core.dependencies import require_admin, get_current_user
-from app.core.supabase import get_supabase
+from app.core.supabase import get_supabase, IN_FILTER_CHUNK as _IN_FILTER_CHUNK
 from app.services.notifications.router import send_push_to_users
 import asyncio
 
@@ -385,24 +385,36 @@ def get_active_ride_requests(
         raise HTTPException(status_code=500, detail=str(e))
 
     from datetime import datetime, timezone, timedelta
+    from collections import Counter
 
-    now = datetime.now(timezone.utc)
-    requests = []
-    for r in result.data or []:
-        user_info = r.pop("users", {}) or {}
+    rows = result.data or []
 
-        # Count bids for this request
-        bid_count = 0
+    # Bid counts for every pending request in one bulk lookup rather than a query per
+    # row. This endpoint is polled every 30s by the rides view, so the per-row version
+    # put one Supabase round trip per pending request on every poll.
+    bid_counts: Counter = Counter()
+    request_ids = [r["id"] for r in rows if r.get("id")]
+    for i in range(0, len(request_ids), _IN_FILTER_CHUNK):
+        chunk = request_ids[i : i + _IN_FILTER_CHUNK]
         try:
             bids = (
                 sb.table("driver_responses")
-                .select("id", count="exact")
-                .eq("ride_request_id", r.get("id"))
+                .select("ride_request_id")
+                .in_("ride_request_id", chunk)
                 .execute()
             )
-            bid_count = len(bids.data or [])
+            bid_counts.update(
+                b["ride_request_id"] for b in (bids.data or []) if b.get("ride_request_id")
+            )
         except Exception:
             pass
+
+    now = datetime.now(timezone.utc)
+    requests = []
+    for r in rows:
+        user_info = r.pop("users", {}) or {}
+
+        bid_count = bid_counts.get(r.get("id"), 0)
 
         # Determine if stale
         created_str = r.get("created_at")

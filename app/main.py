@@ -1,3 +1,6 @@
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -23,20 +26,27 @@ from app.services.admin_ui.router import router as admin_ui_router
 from app.services.live_location.router import router as live_location_router
 from app.core.scheduler import start_scheduler, stop_scheduler
 
+logger = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Start the background scheduler for the lifetime of the app.
+
+    Replaces the deprecated @app.on_event("startup"/"shutdown") hooks, which are
+    scheduled for removal in a future FastAPI release.
+    """
+    start_scheduler()
+    try:
+        yield
+    finally:
+        stop_scheduler()
+
+
 app = FastAPI(
     title=settings.APP_NAME,
     version="1.0.0",
+    lifespan=lifespan,
 )
-
-
-@app.on_event("startup")
-def on_startup():
-    start_scheduler()
-
-
-@app.on_event("shutdown")
-def on_shutdown():
-    stop_scheduler()
 
 # Enhance the auto-generated HTTPBearer security scheme with a description
 from fastapi.openapi.utils import get_openapi
@@ -62,10 +72,15 @@ def custom_openapi():
 
 app.openapi = custom_openapi
 
+_IS_PRODUCTION = settings.ENVIRONMENT.strip().lower() in {"production", "prod"}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    # Localhost is convenient in development, but combined with allow_credentials it
+    # lets anything served from a developer machine call the admin API, so it is not
+    # enabled in production. Add real deploy URLs via ADMIN_FRONTEND_ORIGINS.
+    allow_origin_regex=None if _IS_PRODUCTION else r"https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -74,7 +89,11 @@ app.add_middleware(
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    return JSONResponse(status_code=500, content={"detail": str(exc)})
+    # str(exc) on an unhandled error routinely carries table names, SQL fragments and
+    # connection details. Log it server-side; return an opaque message in production.
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    detail = "Internal server error" if _IS_PRODUCTION else str(exc)
+    return JSONResponse(status_code=500, content={"detail": detail})
 
 
 app.include_router(wallet_router, prefix=settings.API_V1_PREFIX)

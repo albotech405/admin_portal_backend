@@ -11,6 +11,19 @@ logger = logging.getLogger(__name__)
 
 _client: Optional[Client] = None
 
+# Max ids per ?in=(...) filter, to stay well inside PostgREST's URL length limit.
+IN_FILTER_CHUNK = 200
+
+
+def count_of(query) -> int:
+    """Execute a head+exact count query and return the row count.
+
+    PostgREST reports the total in the Content-Range header, so the matching rows are
+    never transferred. Use this instead of len(result.data) for any pure count —
+    otherwise the query slows down in proportion to table size.
+    """
+    return query.execute().count or 0
+
 
 def get_supabase() -> Client:
     global _client

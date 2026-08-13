@@ -450,18 +450,34 @@ def create_driver(body: CreateDriverRequest, _user: dict = Depends(require_role(
 @router.get("/admin/list", response_model=DriverAdminListResponse)
 def list_drivers(
     verification_status: Optional[str] = Query(None),
+    limit: Optional[int] = Query(None, ge=1, le=1000, description="Page size; omit to return every match."),
+    offset: int = Query(0, ge=0),
     _user=Depends(require_driver_document_access),
 ):
+    """List drivers for the admin queue.
+
+    `limit`/`offset` are optional so existing callers that expect the whole list keep
+    working unchanged. Each row carries its joined user and document rows, making this
+    one of the heaviest admin responses — paginate once the fleet outgrows one page.
+    `total` always reports the full match count rather than the size of the page
+    returned, so a caller can tell when it is looking at a partial list.
+    """
     try:
         sb = get_supabase()
         query = sb.table("driver_profiles").select(
-            "*, users(full_name, phone_number, role, is_active), driver_documents(*)"
+            "*, users(full_name, phone_number, role, is_active), driver_documents(*)",
+            count="exact",
         )
         if verification_status:
             query = query.eq("verification_status", verification_status)
-        result = query.order("created_at", desc=True).execute()
+        query = query.order("created_at", desc=True)
+        if limit is not None:
+            query = query.range(offset, offset + limit - 1)
+        result = query.execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    total_matched = result.count if result.count is not None else len(result.data or [])
 
     customer_profile_user_ids = _load_customer_profile_user_ids(
         sb,
@@ -485,7 +501,7 @@ def list_drivers(
             **document_summary,
         ))
 
-    return DriverAdminListResponse(drivers=drivers, total=len(drivers))
+    return DriverAdminListResponse(drivers=drivers, total=total_matched)
 
 
 @router.get("/by-user/{user_id}", response_model=DriverProfileFullResponse)
