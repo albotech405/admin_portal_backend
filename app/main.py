@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from app.core.config import settings
 from app.services.admin.router import router as admin_router
 from app.services.wallet.router import router as wallet_router
+from app.services.customer_wallet.router import router as customer_wallet_router
 from app.services.drivers.router import router as drivers_router
 from app.services.rides.router import router as rides_router
 from app.services.disputes.router import router as disputes_router, disputes_router as disputes_alt_router
@@ -97,6 +98,7 @@ async def generic_exception_handler(request: Request, exc: Exception):
 
 
 app.include_router(wallet_router, prefix=settings.API_V1_PREFIX)
+app.include_router(customer_wallet_router, prefix=settings.API_V1_PREFIX)
 app.include_router(drivers_router, prefix=settings.API_V1_PREFIX)
 app.include_router(rides_router, prefix=settings.API_V1_PREFIX)
 app.include_router(disputes_router, prefix=settings.API_V1_PREFIX)

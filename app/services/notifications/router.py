@@ -13,6 +13,23 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# Mirrors the `notificationtype` Postgres enum (confirmed live 2026-08-24 via
+# `SELECT enumlabel FROM pg_enum ...`). Not enforced by FastAPI validation here â
+# the DB enum is the actual source of truth and would reject an unknown value on
+# insert anyway â this list exists so admin filtering/docs don't have to guess at
+# valid values, and so the wallet/referral/SOS types added by the App backend's
+# 2026-08 notification-persistence work are discoverable without a DB query.
+NOTIFICATION_TYPES = [
+    "ride_request", "ride_accepted", "ride_started", "ride_completed", "ride_cancelled",
+    "sos_alert", "sos_response", "sos_resolved",
+    "wallet_topup", "wallet_topup_approved", "wallet_topup_rejected",
+    "customer_referral_reward", "driver_referral_reward",
+    "customer_welcome_bonus", "driver_welcome_bonus",
+    "driver_approved", "driver_rejected", "driver_application_rejected", "driver_arrived",
+    "offer_accepted", "trip_started", "trip_completed",
+    "payment", "system", "general",
+]
+
 
 def _notifications_support_metadata(sb) -> bool:
     try:
@@ -320,9 +337,24 @@ def get_notification_history(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     status: Optional[str] = Query(None),
+    notification_type: Optional[str] = Query(
+        None,
+        description=(
+            "Filter by notification_type (the `notificationtype` Postgres enum). "
+            f"Valid values: {', '.join(NOTIFICATION_TYPES)}"
+        ),
+    ),
+    user_id: Optional[str] = Query(None),
     _user=Depends(require_admin),
 ):
-    """View sent notification history with pagination."""
+    """View sent notification history with pagination.
+
+    notification_type is a real Postgres enum (`notificationtype`), confirmed live
+    2026-08-24 â see NOTIFICATION_TYPES above. Any row the App backend writes,
+    including the wallet/referral/SOS types added in its 2026-08 notification-
+    persistence work, surfaces here automatically without an admin-side schema
+    change â this endpoint has always read the column generically.
+    """
     sb = get_supabase()
 
     try:
@@ -334,11 +366,19 @@ def get_notification_history(
 
         if status:
             query = query.eq("status", status)
+        if notification_type:
+            query = query.eq("notification_type", notification_type)
+        if user_id:
+            query = query.eq("user_id", user_id)
 
         # Get total count
         count_query = sb.table("notifications").select("id", count="exact")
         if status:
             count_query = count_query.eq("status", status)
+        if notification_type:
+            count_query = count_query.eq("notification_type", notification_type)
+        if user_id:
+            count_query = count_query.eq("user_id", user_id)
         count_result = count_query.execute()
         total = count_result.count or 0
 

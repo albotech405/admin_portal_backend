@@ -43,6 +43,8 @@ class DriverAdminListItem(BaseModel):
     license_number: str
     license_expiry: str
     vehicle_type: Optional[str] = None
+    category: Optional[str] = None
+    passenger_preference: Optional[str] = None
     verification_status: str
     is_online: bool = False
     rating: float = 0.0
@@ -777,15 +779,26 @@ def block_driver(driver_id: str, _user=Depends(require_admin)):
     return result
 
 
+DRIVER_CATEGORIES = ("standard", "premium", "lady_driver")
+
+
 class CategoryUpdateBody(BaseModel):
     category: str
+
+    @field_validator("category")
+    @classmethod
+    def category_must_be_valid(cls, v: str) -> str:
+        if v not in DRIVER_CATEGORIES:
+            raise ValueError(f"category must be one of {DRIVER_CATEGORIES}")
+        return v
 
 
 @router.patch("/{driver_id}/category")
 def update_driver_category(driver_id: str, body: CategoryUpdateBody, _user=Depends(require_admin)):
     try:
         sb = get_supabase()
-        sb.table("driver_profiles").update({"vehicle_type": body.category}).eq("id", driver_id).execute()
+        previous = sb.table("driver_profiles").select("category").eq("id", driver_id).maybe_single().execute()
+        sb.table("driver_profiles").update({"category": body.category}).eq("id", driver_id).execute()
         result = sb.table("driver_profiles").select(
             "*, users(full_name, phone_number)"
         ).eq("id", driver_id).maybe_single().execute()
@@ -793,6 +806,18 @@ def update_driver_category(driver_id: str, body: CategoryUpdateBody, _user=Depen
         raise HTTPException(status_code=500, detail=str(e))
     if not result.data:
         raise HTTPException(status_code=404, detail="Driver not found")
+
+    write_audit_log(
+        sb=sb,
+        admin_user=_user,
+        action_type="driver_category_updated",
+        entity_type="driver_profiles",
+        entity_id=driver_id,
+        summary=f"Admin changed driver category to {body.category}",
+        before_state={"category": (previous.data or {}).get("category")} if previous.data else None,
+        after_state={"category": body.category},
+    )
+
     return result.data
 
 
