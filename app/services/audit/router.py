@@ -97,7 +97,7 @@ def get_audit_log(
     sb = get_supabase()
     try:
         query = sb.table("admin_audit_log").select("*")
-        count_query = sb.table("admin_audit_log").select("id", count="exact")
+        count_query = sb.table("admin_audit_log").select("id", count="exact", head=True)
 
         if date_from:
             query = query.gte("created_at", date_from)

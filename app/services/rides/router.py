@@ -906,7 +906,7 @@ def deduct_commission(ride_id: str, _user=Depends(require_admin)):
                     cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
                     existing = (
                         sb.table("notifications")
-                        .select("id", count="exact")
+                        .select("id", count="exact", head=True)
                         .eq("user_id", driver_user_id)
                         .eq("notification_type", "low_balance")
                         .gte("created_at", cutoff)

@@ -667,16 +667,16 @@ def get_pricing_metrics(
             try:
                 # Count active drivers for this category
                 if category == "standard":
-                    driver_result = sb.table("driver_profiles").select("id", count="exact").eq("verification_status", "approved").execute()
+                    driver_result = sb.table("driver_profiles").select("id", count="exact", head=True).eq("verification_status", "approved").execute()
                 else:
-                    driver_result = sb.table("driver_profiles").select("id", count="exact").eq("verification_status", "approved").eq("category", category).execute()
+                    driver_result = sb.table("driver_profiles").select("id", count="exact", head=True).eq("verification_status", "approved").eq("category", category).execute()
                 active_drivers = driver_result.count or 0
             except Exception:
                 pass
 
             try:
                 # Count total ride requests in this category
-                request_result = sb.table("ride_requests").select("id", count="exact").eq("category", category).gte("created_at", cutoff).execute()
+                request_result = sb.table("ride_requests").select("id", count="exact", head=True).eq("category", category).gte("created_at", cutoff).execute()
                 total_requests = request_result.count or 0
             except Exception:
                 pass

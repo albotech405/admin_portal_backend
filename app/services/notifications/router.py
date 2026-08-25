@@ -6,7 +6,7 @@ from uuid import uuid4
 import logging
 
 from app.core.dependencies import require_admin
-from app.core.supabase import get_supabase
+from app.core.supabase import IN_FILTER_CHUNK, call_rpc, first_row, get_supabase, rpc_missing as _rpc_missing
 from app.core.firebase import send_push_multicast, send_push_notification
 
 logger = logging.getLogger(__name__)
@@ -372,7 +372,7 @@ def get_notification_history(
             query = query.eq("user_id", user_id)
 
         # Get total count
-        count_query = sb.table("notifications").select("id", count="exact")
+        count_query = sb.table("notifications").select("id", count="exact", head=True)
         if status:
             count_query = count_query.eq("status", status)
         if notification_type:
@@ -484,24 +484,30 @@ def preview_segment(
         result = query.execute()
         users = result.data or []
 
-        # Filter by min_rides if requested (requires joined count — do it client-side)
-        if min_rides is not None and min_rides > 0:
-            filtered = []
-            for u in users:
+        # Filter by min_rides if requested. PostgREST has no per-group count over
+        # REST, so this batch-fetches every completed ride for the candidate user
+        # set in one (chunked) query and counts client-side, instead of the
+        # previous one-count-query-per-user N+1.
+        if min_rides is not None and min_rides > 0 and users:
+            user_ids = [u["id"] for u in users]
+            ride_counts: dict = {}
+            for i in range(0, len(user_ids), IN_FILTER_CHUNK):
+                chunk = user_ids[i : i + IN_FILTER_CHUNK]
                 try:
                     rides_result = (
                         sb.table("rides")
-                        .select("id", count="exact")
-                        .eq("customer_id", u["id"])
+                        .select("customer_id")
+                        .in_("customer_id", chunk)
                         .eq("status", "completed")
                         .execute()
                     )
-                    count = rides_result.count or 0
-                    if count >= min_rides:
-                        filtered.append(u)
+                    for row in rides_result.data or []:
+                        cid = row.get("customer_id")
+                        if cid:
+                            ride_counts[cid] = ride_counts.get(cid, 0) + 1
                 except Exception:
                     pass
-            users = filtered
+            users = [u for u in users if ride_counts.get(u["id"], 0) >= min_rides]
 
         sample = [{"id": u["id"], "name": u.get("full_name")} for u in users[:5]]
         return {"count": len(users), "sample_users": sample}
@@ -530,7 +536,7 @@ def get_notification_users(
             query = query.or_(f"full_name.ilike.%{search}%,phone_number.ilike.%{search}%")
 
         # Get total count
-        count_query = sb.table("users").select("id", count="exact")
+        count_query = sb.table("users").select("id", count="exact", head=True)
         if role and role != "all":
             count_query = count_query.eq("role", role)
         if search:
@@ -619,28 +625,49 @@ def send_notification_to_user(body: SendToUserBody, _user=Depends(require_admin)
 
 @router.get("/admin/notifications/stats")
 def get_notification_stats(_user=Depends(require_admin)):
-    """Aggregate statistics for the notification dashboard."""
+    """Aggregate statistics for the notification dashboard.
+
+    by_type prefers the get_notification_type_counts Postgres RPC (true server-side
+    GROUP BY, see sql/20260825_notification_stats_rpc.sql) instead of fetching every
+    row of the notifications table to count client-side â that table has no natural
+    upper bound. Falls back to the old full-scan behavior only if the migration
+    hasn't been applied yet, so this stays correct either way.
+    """
     sb = get_supabase()
+    admin_id = (_user or {}).get("id")
     try:
         seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
 
-        total_result = sb.table("notifications").select("id", count="exact").execute()
+        total_result = sb.table("notifications").select("id", count="exact", head=True).execute()
         total_sent = total_result.count or 0
 
         recent_result = (
             sb.table("notifications")
-            .select("id", count="exact")
+            .select("id", count="exact", head=True)
             .gte("created_at", seven_days_ago)
             .execute()
         )
         sent_last_7_days = recent_result.count or 0
 
-        # Count by notification_type as proxy for broadcast vs targeted
-        type_result = sb.table("notifications").select("notification_type").execute()
-        by_type: Dict[str, int] = {}
-        for row in type_result.data or []:
-            t = row.get("notification_type", "unknown")
-            by_type[t] = by_type.get(t, 0) + 1
+        by_type: Optional[Dict[str, int]] = None
+        if admin_id:
+            try:
+                by_type = first_row(call_rpc("get_notification_type_counts", {"p_admin_id": admin_id}))
+            except Exception as e:
+                if not _rpc_missing(e):
+                    raise HTTPException(status_code=500, detail=str(e))
+                logger.warning(
+                    "get_notification_type_counts RPC not found â falling back to a full-table "
+                    "scan. Apply sql/20260825_notification_stats_rpc.sql."
+                )
+
+        if by_type is None:
+            # Count by notification_type as proxy for broadcast vs targeted
+            type_result = sb.table("notifications").select("notification_type").execute()
+            by_type = {}
+            for row in type_result.data or []:
+                t = row.get("notification_type", "unknown")
+                by_type[t] = by_type.get(t, 0) + 1
 
         return {
             "total_sent": total_sent,
@@ -648,5 +675,7 @@ def get_notification_stats(_user=Depends(require_admin)):
             "failed_last_7_days": 0,  # Not tracked server-side currently
             "by_type": by_type,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

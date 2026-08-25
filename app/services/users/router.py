@@ -129,7 +129,7 @@ def get_unread_notification_count(
     sb = get_supabase()
     result = (
         sb.table("notifications")
-        .select("id", count="exact")
+        .select("id", count="exact", head=True)
         .eq("user_id", user_id)
         .is_("read_at", "null")
         .execute()

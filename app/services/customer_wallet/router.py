@@ -5,18 +5,10 @@ from datetime import datetime, timezone, timedelta
 import logging
 
 from app.core.dependencies import require_admin
-from app.core.supabase import call_rpc, first_row, get_supabase
+from app.core.supabase import call_rpc, first_row, get_supabase, rpc_missing as _rpc_missing
 
 router = APIRouter(tags=["customer-wallet"])
 logger = logging.getLogger(__name__)
-
-
-def _rpc_missing(exc: Exception) -> bool:
-    """True if the error looks like 'function does not exist' (PostgREST PGRST202),
-    i.e. the sql/20260825_customer_wallet_metrics_rpc.sql migration hasn't been
-    applied yet. Any other error should still surface normally."""
-    message = str(exc)
-    return "PGRST202" in message or "Could not find the function" in message
 
 CUSTOMER_REFERRAL_DAILY_CAP = 10  # per Admin_APIs_Implementations.md: 10 referrals/referrer/UTC-day
 

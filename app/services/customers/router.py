@@ -362,7 +362,7 @@ def get_customer_trips(
         )
         count_result = (
             sb.table("rides")
-            .select("id", count="exact")
+            .select("id", count="exact", head=True)
             .eq("customer_id", user_id)
             .execute()
         )
@@ -426,7 +426,7 @@ def get_customer_notifications(
         )
         count_result = (
             sb.table("notifications")
-            .select("id", count="exact")
+            .select("id", count="exact", head=True)
             .eq("user_id", user_id)
             .execute()
         )

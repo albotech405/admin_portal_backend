@@ -527,7 +527,7 @@ def list_sessions(
             .range(offset, offset + limit - 1)
             .execute()
         )
-        count_result = sb.table("admin_sessions").select("id", count="exact").execute()
+        count_result = sb.table("admin_sessions").select("id", count="exact", head=True).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"sessions": result.data or [], "total": count_result.count or 0}

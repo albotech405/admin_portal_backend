@@ -245,39 +245,46 @@ def get_offer_update_metrics(_user=Depends(require_admin)):
         # Calculate averages
         result.avg_updates_per_completed_trip = round(total_updates / total_rides, 2) if total_rides > 0 else 0.0
 
-        # Get driver names for high-rate drivers
-        high_rate_drivers = []
+        # Identify high-rate drivers first, then batch-fetch their names in one
+        # .in_() lookup instead of one query per driver inside the loop.
+        high_rate_ids = []
         for driver_id, data in driver_update_map.items():
-            if data["total_offers"] > 0:
-                update_rate = data["updated_offers"] / data["total_offers"]
-            else:
-                update_rate = 0.0
-
+            update_rate = data["updated_offers"] / data["total_offers"] if data["total_offers"] > 0 else 0.0
+            data["_update_rate"] = update_rate
             if update_rate > 0.6:  # > 60% update rate
-                # Fetch driver name
-                try:
-                    driver_info = (
-                        sb.table("driver_profiles")
-                        .select("users(full_name, phone_number)")
-                        .eq("id", driver_id)
-                        .maybe_single()
-                        .execute()
-                    )
-                    if driver_info.data:
-                        user_info = driver_info.data.get("users", {}) or {}
-                        data["full_name"] = user_info.get("full_name")
-                        data["phone_number"] = user_info.get("phone_number")
-                except Exception:
-                    pass
+                high_rate_ids.append(driver_id)
 
-                high_rate_drivers.append(DriverOfferUpdateRate(
-                    driver_id=driver_id,
-                    full_name=data["full_name"],
-                    phone_number=data["phone_number"],
-                    total_offers=data["total_offers"],
-                    updated_offers=data["updated_offers"],
-                    update_rate=round(update_rate, 2),
-                ))
+        driver_names: dict = {}
+        for i in range(0, len(high_rate_ids), _IN_FILTER_CHUNK):
+            chunk = high_rate_ids[i : i + _IN_FILTER_CHUNK]
+            try:
+                driver_rows = (
+                    sb.table("driver_profiles")
+                    .select("id, users(full_name, phone_number)")
+                    .in_("id", chunk)
+                    .execute()
+                )
+                for row in driver_rows.data or []:
+                    user_info = row.get("users") or {}
+                    driver_names[row["id"]] = {
+                        "full_name": user_info.get("full_name"),
+                        "phone_number": user_info.get("phone_number"),
+                    }
+            except Exception:
+                pass
+
+        high_rate_drivers = []
+        for driver_id in high_rate_ids:
+            data = driver_update_map[driver_id]
+            name_info = driver_names.get(driver_id, {})
+            high_rate_drivers.append(DriverOfferUpdateRate(
+                driver_id=driver_id,
+                full_name=name_info.get("full_name"),
+                phone_number=name_info.get("phone_number"),
+                total_offers=data["total_offers"],
+                updated_offers=data["updated_offers"],
+                update_rate=round(data["_update_rate"], 2),
+            ))
 
         result.high_update_rate_drivers = high_rate_drivers
         return result
@@ -481,104 +488,82 @@ def get_cancellation_analytics(
                     if did not in driver_latest or (r.get("cancelled_at") or "") > (driver_latest[did] or ""):
                         driver_latest[did] = r.get("cancelled_at")
 
+        # Batch-fetch every customer/driver name this section could need in at most
+        # 2 queries total (chunked), instead of one query per flagged row.
+        repeat_customer_ids = [cid for cid, count in customer_cancel_map.items() if count > 3]
+        repeat_driver_ids = [did for did, count in driver_cancel_map.items() if count > 3]
+        safety_rows = [r for r in rides_data if r.get("reason_code") == "safety_concern"]
+        safety_customer_ids = [r.get("customer_id") for r in safety_rows if r.get("customer_id")]
+        safety_driver_ids = [r.get("driver_id") for r in safety_rows if r.get("driver_id")]
+
+        all_customer_ids = list({*repeat_customer_ids, *safety_customer_ids})
+        all_driver_ids = list({*repeat_driver_ids, *safety_driver_ids})
+
+        customer_info: dict = {}
+        for i in range(0, len(all_customer_ids), _IN_FILTER_CHUNK):
+            chunk = all_customer_ids[i : i + _IN_FILTER_CHUNK]
+            try:
+                rows = sb.table("users").select("id, full_name, phone_number").in_("id", chunk).execute()
+                for row in rows.data or []:
+                    customer_info[row["id"]] = {"full_name": row.get("full_name"), "phone_number": row.get("phone_number")}
+            except Exception:
+                pass
+
+        driver_info: dict = {}
+        for i in range(0, len(all_driver_ids), _IN_FILTER_CHUNK):
+            chunk = all_driver_ids[i : i + _IN_FILTER_CHUNK]
+            try:
+                rows = sb.table("driver_profiles").select("id, users(full_name, phone_number)").in_("id", chunk).execute()
+                for row in rows.data or []:
+                    user_info = row.get("users") or {}
+                    driver_info[row["id"]] = {"full_name": user_info.get("full_name"), "phone_number": user_info.get("phone_number")}
+            except Exception:
+                pass
+
         repeat_items = []
 
         # Flag customers with >3 cancellations in 24h
-        for cid, count in customer_cancel_map.items():
-            if count > 3:
-                # Fetch customer name
-                name = None
-                phone = None
-                try:
-                    user = sb.table("users").select("full_name, phone_number").eq("id", cid).maybe_single().execute()
-                    if user.data:
-                        name = user.data.get("full_name")
-                        phone = user.data.get("phone_number")
-                except Exception:
-                    pass
-
-                repeat_items.append(RepeatCancellationItem(
-                    user_id=cid,
-                    full_name=name,
-                    phone_number=phone,
-                    user_type="customer",
-                    cancellation_count=count,
-                    latest_cancellation_at=customer_latest.get(cid),
-                    reason_codes=sorted(customer_reason_map.get(cid, set())),
-                ))
+        for cid in repeat_customer_ids:
+            info = customer_info.get(cid, {})
+            repeat_items.append(RepeatCancellationItem(
+                user_id=cid,
+                full_name=info.get("full_name"),
+                phone_number=info.get("phone_number"),
+                user_type="customer",
+                cancellation_count=customer_cancel_map[cid],
+                latest_cancellation_at=customer_latest.get(cid),
+                reason_codes=sorted(customer_reason_map.get(cid, set())),
+            ))
 
         # Flag drivers with >3 cancellations in 24h
-        for did, count in driver_cancel_map.items():
-            if count > 3:
-                name = None
-                phone = None
-                try:
-                    driver = (
-                        sb.table("driver_profiles")
-                        .select("users(full_name, phone_number)")
-                        .eq("id", did)
-                        .maybe_single()
-                        .execute()
-                    )
-                    if driver.data:
-                        user_info = driver.data.get("users", {}) or {}
-                        name = user_info.get("full_name")
-                        phone = user_info.get("phone_number")
-                except Exception:
-                    pass
-
-                repeat_items.append(RepeatCancellationItem(
-                    user_id=did,
-                    full_name=name,
-                    phone_number=phone,
-                    user_type="driver",
-                    cancellation_count=count,
-                    latest_cancellation_at=driver_latest.get(did),
-                    reason_codes=sorted(driver_reason_map.get(did, set())),
-                ))
+        for did in repeat_driver_ids:
+            info = driver_info.get(did, {})
+            repeat_items.append(RepeatCancellationItem(
+                user_id=did,
+                full_name=info.get("full_name"),
+                phone_number=info.get("phone_number"),
+                user_type="driver",
+                cancellation_count=driver_cancel_map[did],
+                latest_cancellation_at=driver_latest.get(did),
+                reason_codes=sorted(driver_reason_map.get(did, set())),
+            ))
 
         # 3. Safety concern queue
         safety_queue = []
-        for r in rides_data:
-            if r.get("reason_code") == "safety_concern":
-                customer_name = None
-                driver_name = None
-
-                try:
-                    cust = sb.table("users").select("full_name").eq("id", r.get("customer_id")).maybe_single().execute()
-                    if cust.data:
-                        customer_name = cust.data.get("full_name")
-                except Exception:
-                    pass
-
-                did = r.get("driver_id")
-                if did:
-                    try:
-                        drv = (
-                            sb.table("driver_profiles")
-                            .select("users(full_name)")
-                            .eq("id", did)
-                            .maybe_single()
-                            .execute()
-                        )
-                        if drv.data:
-                            user_info = drv.data.get("users", {}) or {}
-                            driver_name = user_info.get("full_name")
-                    except Exception:
-                        pass
-
-                safety_queue.append(SafetyConcernCancellation(
-                    ride_id=r.get("id"),
-                    customer_id=r.get("customer_id"),
-                    customer_name=customer_name,
-                    driver_id=r.get("driver_id"),
-                    driver_name=driver_name,
-                    reason_text=r.get("reason_text") or r.get("cancellation_reason"),
-                    cancelled_by=r.get("cancelled_by"),
-                    cancelled_at=r.get("cancelled_at"),
-                    picking_point=r.get("picking_point"),
-                    destination=r.get("destination"),
-                ))
+        for r in safety_rows:
+            did = r.get("driver_id")
+            safety_queue.append(SafetyConcernCancellation(
+                ride_id=r.get("id"),
+                customer_id=r.get("customer_id"),
+                customer_name=customer_info.get(r.get("customer_id"), {}).get("full_name"),
+                driver_id=did,
+                driver_name=driver_info.get(did, {}).get("full_name") if did else None,
+                reason_text=r.get("reason_text") or r.get("cancellation_reason"),
+                cancelled_by=r.get("cancelled_by"),
+                cancelled_at=r.get("cancelled_at"),
+                picking_point=r.get("picking_point"),
+                destination=r.get("destination"),
+            ))
 
         return CancellationAnalyticsResponse(
             total_cancellations=len(rides_data),

@@ -137,7 +137,7 @@ def list_tickets(
         if priority:
             query = query.eq("priority", priority)
 
-        count_query = sb.table("support_tickets").select("id", count="exact")
+        count_query = sb.table("support_tickets").select("id", count="exact", head=True)
         if status:
             count_query = count_query.eq("status", status)
         if priority:
@@ -159,17 +159,24 @@ def list_tickets(
             except Exception:
                 pass
 
+        # Batch-fetch message counts for this page of tickets in one query instead
+        # of one count query per ticket.
+        ticket_ids = [r["id"] for r in rows if r.get("id")]
+        message_counts: dict = {}
+        if ticket_ids:
+            try:
+                mc = sb.table("ticket_messages").select("ticket_id").in_("ticket_id", ticket_ids).execute()
+                for row in mc.data or []:
+                    tid = row.get("ticket_id")
+                    if tid:
+                        message_counts[tid] = message_counts.get(tid, 0) + 1
+            except Exception:
+                pass
+
         tickets = []
         for r in rows:
             uid = r.get("user_id", "")
             uinfo = user_map.get(uid, {})
-
-            msg_count = 0
-            try:
-                mc = sb.table("ticket_messages").select("id", count="exact").eq("ticket_id", r["id"]).execute()
-                msg_count = mc.count or 0
-            except Exception:
-                pass
 
             tickets.append(TicketListItem(
                 id=r["id"],
@@ -181,7 +188,7 @@ def list_tickets(
                 status=r.get("status", "open"),
                 priority=r.get("priority", "normal"),
                 assigned_to=r.get("assigned_to"),
-                message_count=msg_count,
+                message_count=message_counts.get(r["id"], 0),
                 created_at=r.get("created_at", ""),
                 updated_at=r.get("updated_at", ""),
             ))

@@ -84,3 +84,12 @@ def first_row(data: Any) -> Any:
     if isinstance(data, list):
         return data[0] if data else None
     return data
+
+
+def rpc_missing(exc: Exception) -> bool:
+    """True if the error looks like 'function does not exist' (PostgREST PGRST202),
+    i.e. an RPC migration under sql/ hasn't been applied yet. Callers should use this
+    to fall back to a slower-but-correct path rather than hard-failing, and re-raise
+    for every other error."""
+    message = str(exc)
+    return "PGRST202" in message or "Could not find the function" in message
