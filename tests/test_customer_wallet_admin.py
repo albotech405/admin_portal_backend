@@ -5,6 +5,7 @@ from app.services.customer_wallet.router import (
     CustomerWalletTransactionItem,
     DriverReferralItem,
     ReferralItem,
+    _rpc_missing,
 )
 
 
@@ -75,6 +76,16 @@ class CustomerWalletAdminModelTests(unittest.TestCase):
         self.assertEqual(item.referrer_reward_cdf, 10000)
         self.assertEqual(item.referred_reward_cdf, 5000)
         self.assertEqual(item.completed_rides, item.required_rides)
+
+    def test_rpc_missing_detects_postgrest_function_not_found(self) -> None:
+        # PGRST202 is what PostgREST returns when the RPC hasn't been created yet
+        # (i.e. sql/20260825_customer_wallet_metrics_rpc.sql not applied) -- the
+        # metrics endpoints must fall back to client-side aggregation for exactly
+        # this error and re-raise everything else.
+        self.assertTrue(_rpc_missing(Exception('{"code":"PGRST202","message":"Could not find the function"}')))
+        self.assertTrue(_rpc_missing(Exception("Could not find the function public.get_customer_wallet_metrics")))
+        self.assertFalse(_rpc_missing(Exception("connection refused")))
+        self.assertFalse(_rpc_missing(Exception("admin access required")))
 
 
 if __name__ == "__main__":

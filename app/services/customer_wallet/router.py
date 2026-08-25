@@ -2,11 +2,21 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timezone, timedelta
+import logging
 
 from app.core.dependencies import require_admin
-from app.core.supabase import get_supabase
+from app.core.supabase import call_rpc, first_row, get_supabase
 
 router = APIRouter(tags=["customer-wallet"])
+logger = logging.getLogger(__name__)
+
+
+def _rpc_missing(exc: Exception) -> bool:
+    """True if the error looks like 'function does not exist' (PostgREST PGRST202),
+    i.e. the sql/20260825_customer_wallet_metrics_rpc.sql migration hasn't been
+    applied yet. Any other error should still surface normally."""
+    message = str(exc)
+    return "PGRST202" in message or "Could not find the function" in message
 
 CUSTOMER_REFERRAL_DAILY_CAP = 10  # per Admin_APIs_Implementations.md: 10 referrals/referrer/UTC-day
 
@@ -74,12 +84,29 @@ _METRICS_ROW_CAP = 50_000
 
 @router.get("/customer-wallet/admin/metrics", response_model=CustomerWalletMetricsResponse)
 def get_customer_wallet_metrics(_user=Depends(require_admin)):
-    """Aggregate customer wallet reward metrics, summed client-side from a capped fetch.
+    """Aggregate customer wallet reward metrics.
 
-    See _METRICS_ROW_CAP above: this is not a true server-side aggregate. Fine at
-    current volume; needs a Postgres SUM() RPC before this cap is ever reached.
+    Prefers the get_customer_wallet_metrics Postgres RPC (true server-side SUM/COUNT,
+    see sql/20260825_customer_wallet_metrics_rpc.sql) so totals are always correct
+    regardless of table size. Falls back to a capped client-side summation (see
+    _METRICS_ROW_CAP) only if that migration hasn't been applied yet â that fallback
+    path can silently under-report once transaction volume exceeds the cap.
     """
     sb = get_supabase()
+    admin_id = (_user or {}).get("id")
+
+    if admin_id:
+        try:
+            result = first_row(call_rpc("get_customer_wallet_metrics", {"p_admin_id": admin_id}))
+            if result:
+                return CustomerWalletMetricsResponse(**result)
+        except Exception as e:
+            if not _rpc_missing(e):
+                raise HTTPException(status_code=500, detail=str(e))
+            logger.warning(
+                "get_customer_wallet_metrics RPC not found â falling back to capped "
+                "client-side aggregation. Apply sql/20260825_customer_wallet_metrics_rpc.sql."
+            )
 
     try:
         balances = sb.table("users").select("id, wallet_balance_cdf").gt("wallet_balance_cdf", 0).limit(_METRICS_ROW_CAP).execute()
@@ -611,8 +638,26 @@ def get_welcome_bonus_metrics(_user=Depends(require_admin)):
     driver welcome bonus (reference_type='driver_welcome_bonus' in wallet_transactions)
     are mutually exclusive with referral rewards by construction upstream â this just
     sums each ledger's own rows, it doesn't re-derive the eligibility rule.
+
+    Prefers the get_welcome_bonus_metrics Postgres RPC (true server-side SUM/COUNT,
+    see sql/20260825_customer_wallet_metrics_rpc.sql); falls back to a capped
+    client-side sum if that migration hasn't been applied yet.
     """
     sb = get_supabase()
+    admin_id = (_user or {}).get("id")
+
+    if admin_id:
+        try:
+            result = first_row(call_rpc("get_welcome_bonus_metrics", {"p_admin_id": admin_id}))
+            if result:
+                return WelcomeBonusMetricsResponse(**result)
+        except Exception as e:
+            if not _rpc_missing(e):
+                raise HTTPException(status_code=500, detail=str(e))
+            logger.warning(
+                "get_welcome_bonus_metrics RPC not found â falling back to capped "
+                "client-side aggregation. Apply sql/20260825_customer_wallet_metrics_rpc.sql."
+            )
 
     try:
         customer_rows = (
