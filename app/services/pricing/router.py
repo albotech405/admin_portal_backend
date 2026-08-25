@@ -592,7 +592,11 @@ def simulate_fare(
         config_result = sb.table("app_config").select("*").execute()
         config_map = {c["key"]: c["value"] for c in (config_result.data or [])}
 
-        vat_rate = float(config_map.get("vat_rate", 0.16))
+        # VAT is not currently collected (2026-08-25). Forced to 0 here rather than
+        # removed from the pipeline/config, since it's expected to come back later —
+        # revert this one line (restore `float(config_map.get("vat_rate", 0.16))`)
+        # when VAT collection resumes.
+        vat_rate = 0.0
         day_multiplier = float(config_map.get("day_multiplier", 1.00))
         evening_multiplier = float(config_map.get("evening_multiplier", 1.10))
         commission_rate = float(config_map.get("commission_rate", 0.05))
