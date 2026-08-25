@@ -13,6 +13,21 @@ bearer_scheme = HTTPBearer(auto_error=False)
 # Role hierarchy: higher index = more permissive override
 ROLE_HIERARCHY = ["readonly", "support", "finance", "operations", "super_admin"]
 
+# Every admin request calls _verify_token, which historically opened a brand-new
+# TCP+TLS connection to Supabase per call (plain httpx.get(...) with no client reuse).
+# A single module-level client with a connection pool + keep-alive avoids paying that
+# handshake cost on every request — same fix already applied to get_supabase() in
+# app/core/supabase.py. Pure connection-reuse change: request/response behavior,
+# timeout, and error handling are all unchanged.
+_auth_http_client: Optional[httpx.Client] = None
+
+
+def _get_auth_http_client() -> httpx.Client:
+    global _auth_http_client
+    if _auth_http_client is None:
+        _auth_http_client = httpx.Client(timeout=10)
+    return _auth_http_client
+
 
 def _verify_token(token: str) -> dict:
     """
@@ -23,13 +38,12 @@ def _verify_token(token: str) -> dict:
     """
     # --- Primary: direct HTTP call to Supabase auth API ---
     try:
-        resp = httpx.get(
+        resp = _get_auth_http_client().get(
             f"{settings.SUPABASE_URL}/auth/v1/user",
             headers={
                 "Authorization": f"Bearer {token}",
                 "apikey": settings.SUPABASE_KEY,
             },
-            timeout=10,
         )
         if resp.status_code == 200:
             data = resp.json()
