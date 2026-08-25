@@ -303,6 +303,18 @@ def ban_customer(user_id: str, body: Optional[BanUnbanBody] = None, _user=Depend
 
     if not result.data:
         raise HTTPException(status_code=404, detail="Customer not found")
+
+    write_audit_log(
+        sb=sb,
+        admin_user=_user,
+        action_type="customer_banned",
+        entity_type="users",
+        entity_id=user_id,
+        summary=f"Admin banned customer{': ' + body.reason if body and body.reason else ''}",
+        before_state={"is_active": True},
+        after_state={"is_active": False, "reason": body.reason if body else None},
+    )
+
     return {"message": "Customer banned", "reason": body.reason if body else None}
 
 
@@ -316,6 +328,18 @@ def unban_customer(user_id: str, _user=Depends(require_admin)):
 
     if not result.data:
         raise HTTPException(status_code=404, detail="Customer not found")
+
+    write_audit_log(
+        sb=sb,
+        admin_user=_user,
+        action_type="customer_unbanned",
+        entity_type="users",
+        entity_id=user_id,
+        summary="Admin unbanned customer",
+        before_state={"is_active": False},
+        after_state={"is_active": True},
+    )
+
     return {"message": "Customer unbanned"}
 
 

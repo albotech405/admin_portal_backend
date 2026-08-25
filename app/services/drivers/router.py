@@ -784,6 +784,7 @@ DRIVER_CATEGORIES = ("standard", "premium", "lady_driver")
 
 class CategoryUpdateBody(BaseModel):
     category: str
+    reason: str = Field(..., min_length=1, description="Required per AdminSide.md §3.2: every category change must carry a reason")
 
     @field_validator("category")
     @classmethod
@@ -813,9 +814,9 @@ def update_driver_category(driver_id: str, body: CategoryUpdateBody, _user=Depen
         action_type="driver_category_updated",
         entity_type="driver_profiles",
         entity_id=driver_id,
-        summary=f"Admin changed driver category to {body.category}",
+        summary=f"Admin changed driver category to {body.category}: {body.reason}",
         before_state={"category": (previous.data or {}).get("category")} if previous.data else None,
-        after_state={"category": body.category},
+        after_state={"category": body.category, "reason": body.reason},
     )
 
     return result.data

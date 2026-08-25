@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 from typing import Optional
 from app.core.dependencies import require_admin
 from app.core.supabase import get_supabase
+from app.services.audit.router import write_audit_log
 
 router = APIRouter(prefix="/config", tags=["config"])
 
@@ -211,6 +212,7 @@ def get_app_toggles(_user=Depends(require_admin)):
 def update_app_toggles(body: UpdateAppConfigBody, _user=Depends(require_admin)):
     try:
         sb = get_supabase()
+        before = get_app_toggles(_user)
 
         if body.active_request_resume_enabled is not None:
             _set_config_value(sb, "active_request_resume_enabled", str(body.active_request_resume_enabled).lower())
@@ -221,8 +223,20 @@ def update_app_toggles(body: UpdateAppConfigBody, _user=Depends(require_admin)):
         if body.stale_request_alert_threshold_minutes is not None:
             _set_config_value(sb, "stale_request_alert_threshold_minutes", str(body.stale_request_alert_threshold_minutes))
 
-        # Return updated state
-        return get_app_toggles(_user)
+        after = get_app_toggles(_user)
+
+        write_audit_log(
+            sb=sb,
+            admin_user=_user,
+            action_type="app_toggles_updated",
+            entity_type="app_config",
+            entity_id="app-toggles",
+            summary="Admin updated app configuration toggles",
+            before_state=before.model_dump(),
+            after_state=after.model_dump(),
+        )
+
+        return after
     except HTTPException:
         raise
     except Exception as e:

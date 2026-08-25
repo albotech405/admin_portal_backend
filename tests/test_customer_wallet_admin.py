@@ -31,6 +31,19 @@ class CustomerWalletAdminModelTests(unittest.TestCase):
         self.assertEqual(item.amount_cdf, 5000)
         self.assertEqual(item.driver_id, "d1")
 
+    def test_change_credit_item_carries_reference_id_for_idempotency_checks(self) -> None:
+        item = ChangeCreditItem(
+            id="t2", ride_id="r1", reference_id="r1", customer_id="u1",
+            amount_cdf=5000, created_at="2026-08-01T00:00:00Z",
+        )
+        self.assertEqual(item.reference_id, "r1")
+
+        no_reference = ChangeCreditItem(
+            id="t3", ride_id="r2", customer_id="u1",
+            amount_cdf=3000, created_at="2026-08-01T00:00:00Z",
+        )
+        self.assertIsNone(no_reference.reference_id)
+
     def test_referral_item_keeps_referrer_and_referred_rewards_distinct(self) -> None:
         item = ReferralItem(
             id="ref1", referrer_user_id="u1", referred_user_id="u2",

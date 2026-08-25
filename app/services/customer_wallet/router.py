@@ -62,18 +62,27 @@ class CustomerWalletMetricsResponse(BaseModel):
     change_credit_count: int
 
 
+# PostgREST has no server-side SUM()/aggregate without a custom Postgres RPC
+# function, which would need its own SQL migration against the shared production
+# schema. Until that RPC exists, these metrics are summed client-side from a
+# capped row fetch. The cap is a safety net against unbounded growth, not a
+# correctness guarantee â metrics will silently under-report once transaction
+# volume exceeds it. Replace with a real DB-side aggregate RPC when that's
+# authored; do not raise this cap as a substitute for the real fix.
+_METRICS_ROW_CAP = 50_000
+
+
 @router.get("/customer-wallet/admin/metrics", response_model=CustomerWalletMetricsResponse)
 def get_customer_wallet_metrics(_user=Depends(require_admin)):
-    """Aggregate customer wallet reward metrics, computed from the ledger.
+    """Aggregate customer wallet reward metrics, summed client-side from a capped fetch.
 
-    All aggregation happens server-side against customer_wallet_transactions /
-    users so the admin dashboard never has to pull the full transaction table to
-    compute a KPI.
+    See _METRICS_ROW_CAP above: this is not a true server-side aggregate. Fine at
+    current volume; needs a Postgres SUM() RPC before this cap is ever reached.
     """
     sb = get_supabase()
 
     try:
-        balances = sb.table("users").select("id, wallet_balance_cdf").gt("wallet_balance_cdf", 0).execute()
+        balances = sb.table("users").select("id, wallet_balance_cdf").gt("wallet_balance_cdf", 0).limit(_METRICS_ROW_CAP).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     total_balance = sum((float(r.get("wallet_balance_cdf") or 0) for r in (balances.data or [])), 0.0)
@@ -83,6 +92,7 @@ def get_customer_wallet_metrics(_user=Depends(require_admin)):
         txns = (
             sb.table("customer_wallet_transactions")
             .select("amount_cdf, type, source")
+            .limit(_METRICS_ROW_CAP)
             .execute()
         )
     except Exception as e:
@@ -202,6 +212,7 @@ def list_customer_wallet_transactions(
 class ChangeCreditItem(BaseModel):
     id: str
     ride_id: Optional[str] = None
+    reference_id: Optional[str] = None
     customer_id: str
     customer_name: Optional[str] = None
     customer_phone: Optional[str] = None
@@ -275,6 +286,7 @@ def list_change_credits(
         items.append(ChangeCreditItem(
             id=r["id"],
             ride_id=r.get("ride_id"),
+            reference_id=r.get("reference_id"),
             customer_id=r["user_id"],
             customer_name=user_info.get("full_name"),
             customer_phone=user_info.get("phone_number"),
@@ -407,6 +419,7 @@ def get_customer_referral_fraud_signals(_user=Depends(require_admin)):
             sb.table("referrals")
             .select("referrer_user_id")
             .gte("created_at", since)
+            .limit(_METRICS_ROW_CAP)
             .execute()
         )
         counts: dict = {}
@@ -434,6 +447,7 @@ def get_customer_referral_fraud_signals(_user=Depends(require_admin)):
             sb.table("referrals")
             .select("id, referred_phone_number_hash")
             .not_.is_("referred_phone_number_hash", "null")
+            .limit(_METRICS_ROW_CAP)
             .execute()
         )
         hash_to_ids: dict = {}
@@ -606,6 +620,7 @@ def get_welcome_bonus_metrics(_user=Depends(require_admin)):
             .select("amount_cdf")
             .eq("source", "first_ride")
             .eq("type", "credit")
+            .limit(_METRICS_ROW_CAP)
             .execute()
         )
     except Exception as e:
@@ -617,6 +632,7 @@ def get_welcome_bonus_metrics(_user=Depends(require_admin)):
             sb.table("wallet_transactions")
             .select("amount")
             .eq("reference_type", "driver_welcome_bonus")
+            .limit(_METRICS_ROW_CAP)
             .execute()
         )
     except Exception as e:
