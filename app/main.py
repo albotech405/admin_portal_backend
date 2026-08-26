@@ -26,16 +26,28 @@ from app.services.ws.router import router as ws_router
 from app.services.admin_ui.router import router as admin_ui_router
 from app.services.live_location.router import router as live_location_router
 from app.core.scheduler import start_scheduler, stop_scheduler
+from app.core.migrations import run_migrations
 
 logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Start the background scheduler for the lifetime of the app.
+    """Apply pending sql/*.sql migrations, then start the background scheduler,
+    for the lifetime of the app.
+
+    Migrations run first and are allowed to raise: an exception raised before
+    `yield` in this lifespan context manager prevents uvicorn from ever entering
+    the "serving" state -- the process exits instead. Intentional (see
+    app/core/migrations.py): the app must never serve traffic against a schema
+    it failed to bring up to date.
 
     Replaces the deprecated @app.on_event("startup"/"shutdown") hooks, which are
     scheduled for removal in a future FastAPI release.
     """
+    if settings.AUTO_MIGRATE_ENABLED:
+        run_migrations()
+    else:
+        logger.warning("[migrations] AUTO_MIGRATE_ENABLED=false; skipping migration runner")
     start_scheduler()
     try:
         yield

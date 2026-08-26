@@ -50,6 +50,11 @@ class Settings(BaseSettings):
     SOS_ALLOWED_SHARE_DURATIONS_MINUTES: str = Field(default="15,60,480")
     SOS_ROUTE_HISTORY_LIMIT: int = Field(default=50)
 
+    # Auto-apply pending sql/*.sql migrations on startup (see app/core/migrations.py).
+    # Escape hatch: set to false in Render if a bad migration file blocks a deploy
+    # and the app needs to boot without applying it while the file is fixed.
+    AUTO_MIGRATE_ENABLED: bool = Field(default=True)
+
     ALLOWED_ORIGINS: str = Field(default="http://localhost:3000,http://localhost:3001,http://localhost:5173")
     ADMIN_FRONTEND_ORIGINS: str = Field(default="")
 
