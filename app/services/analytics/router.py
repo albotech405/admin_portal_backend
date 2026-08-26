@@ -2,7 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from typing import List, Optional, Any
 from app.core.dependencies import require_admin
-from app.core.supabase import get_supabase, count_of, IN_FILTER_CHUNK as _IN_FILTER_CHUNK
+from app.core.supabase import (
+    get_supabase, count_of, call_rpc, first_row, rpc_missing,
+    IN_FILTER_CHUNK as _IN_FILTER_CHUNK,
+)
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import logging
@@ -345,6 +348,180 @@ def get_driver_locations(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+_HEATMAP_ROW_CAP = 50_000  # safety cap for the client-side fallback, same idiom as customer_wallet._METRICS_ROW_CAP
+
+
+def _bucket(value: float, grid_size: float) -> float:
+    return round(round(value / grid_size) * grid_size, 6)
+
+
+def _lat_lng_from_point(value: Any) -> Optional[tuple]:
+    if not isinstance(value, dict):
+        return None
+    lat = value.get("latitude")
+    if lat is None:
+        lat = value.get("lat")
+    lng = value.get("longitude")
+    if lng is None:
+        lng = value.get("lng")
+    if lat is None or lng is None:
+        return None
+    try:
+        return float(lat), float(lng)
+    except (TypeError, ValueError):
+        return None
+
+
+class HeatmapCell(BaseModel):
+    grid_lat: float
+    grid_lng: float
+    demand_count: int = 0
+    supply_count: int = 0
+
+
+class HeatmapResponse(BaseModel):
+    generated_at: str = ""
+    grid_size_deg: float = 0.01
+    source: str = "requests"
+    days: int = 7
+    demand_points_included: int = 0
+    demand_points_skipped: int = 0
+    supply_points_included: int = 0
+    cells: List[HeatmapCell] = []
+
+
+@router.get("/admin/heatmap", response_model=HeatmapResponse)
+def get_heatmap(
+    days: int = Query(7, description="Days of ride_requests/rides history for demand counts"),
+    source: str = Query("requests", description="Demand source: 'requests' (ride_requests) or 'rides' (historical)"),
+    category: Optional[str] = Query(None, description="Filter: standard/premium/lady_driver"),
+    vehicle_type: Optional[str] = Query(None, description="Filter: car/moto/tuk_tuk/van/suv"),
+    grid_size_deg: float = Query(0.01, ge=0.001, le=0.5, description="Grid cell size in degrees (~0.01 ≈ 1.1km)"),
+    _user=Depends(require_admin),
+):
+    """
+    Grid-bucketed demand (ride_requests/rides picking_point) vs supply
+    (driver_profiles lat/lng) counts, for an ops hotspot/heatmap view.
+
+    Prefers the get_admin_heatmap Postgres RPC (grid-bucketing done
+    server-side, see sql/20260825_heatmap_rpc.sql) so cell counts are correct
+    regardless of table size. Falls back to a capped client-side bucketing
+    pass (see _HEATMAP_ROW_CAP) only if that migration hasn't been applied
+    yet -- that fallback path can silently under-report once row volume
+    exceeds the cap.
+    """
+    demand_table = "rides" if source == "rides" else "requests"
+    sb = get_supabase()
+    admin_id = (_user or {}).get("id")
+    generated_at = datetime.now(timezone.utc).isoformat()
+
+    if admin_id:
+        try:
+            result = first_row(call_rpc("get_admin_heatmap", {
+                "p_admin_id": admin_id,
+                "p_days": days,
+                "p_source": demand_table,
+                "p_category": category,
+                "p_vehicle_type": vehicle_type,
+                "p_grid_size": grid_size_deg,
+            }))
+            if result:
+                return HeatmapResponse(
+                    generated_at=generated_at,
+                    grid_size_deg=grid_size_deg,
+                    source=demand_table,
+                    days=days,
+                    demand_points_included=result.get("demand_points_included", 0),
+                    demand_points_skipped=result.get("demand_points_skipped", 0),
+                    supply_points_included=result.get("supply_points_included", 0),
+                    cells=[HeatmapCell(**c) for c in (result.get("cells") or [])],
+                )
+        except Exception as e:
+            if not rpc_missing(e):
+                raise HTTPException(status_code=500, detail=str(e))
+            logger.warning(
+                "get_admin_heatmap RPC not found, falling back to capped "
+                "client-side grid bucketing. Apply sql/20260825_heatmap_rpc.sql."
+            )
+
+    cutoff_str = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    table_name = "rides" if demand_table == "rides" else "ride_requests"
+
+    try:
+        demand_query = (
+            sb.table(table_name)
+            .select("picking_point")
+            .gte("created_at", cutoff_str)
+            .limit(_HEATMAP_ROW_CAP)
+        )
+        if category:
+            demand_query = demand_query.eq("category", category)
+        if vehicle_type:
+            demand_query = demand_query.eq("vehicle_type", vehicle_type)
+        demand_rows = demand_query.execute().data or []
+    except Exception:
+        demand_rows = []
+
+    try:
+        supply_query = (
+            sb.table("driver_profiles")
+            .select("latitude, longitude")
+            .eq("is_online", True)
+            .not_.is_("latitude", "null")
+            .not_.is_("longitude", "null")
+            .limit(_HEATMAP_ROW_CAP)
+        )
+        if category:
+            supply_query = supply_query.eq("category", category)
+        if vehicle_type:
+            supply_query = supply_query.eq("vehicle_type", vehicle_type)
+        supply_rows = supply_query.execute().data or []
+    except Exception:
+        supply_rows = []
+
+    cell_map: dict = {}
+    demand_included = 0
+    demand_skipped = 0
+
+    for row in demand_rows:
+        point = _lat_lng_from_point(row.get("picking_point"))
+        if not point:
+            demand_skipped += 1
+            continue
+        lat, lng = point
+        key = (_bucket(lat, grid_size_deg), _bucket(lng, grid_size_deg))
+        cell_map.setdefault(key, {"demand": 0, "supply": 0})
+        cell_map[key]["demand"] += 1
+        demand_included += 1
+
+    supply_included = 0
+    for row in supply_rows:
+        try:
+            lat, lng = float(row["latitude"]), float(row["longitude"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        key = (_bucket(lat, grid_size_deg), _bucket(lng, grid_size_deg))
+        cell_map.setdefault(key, {"demand": 0, "supply": 0})
+        cell_map[key]["supply"] += 1
+        supply_included += 1
+
+    cells = [
+        HeatmapCell(grid_lat=k[0], grid_lng=k[1], demand_count=v["demand"], supply_count=v["supply"])
+        for k, v in cell_map.items()
+    ]
+
+    return HeatmapResponse(
+        generated_at=generated_at,
+        grid_size_deg=grid_size_deg,
+        source=demand_table,
+        days=days,
+        demand_points_included=demand_included,
+        demand_points_skipped=demand_skipped,
+        supply_points_included=supply_included,
+        cells=cells,
+    )
 
 
 class CancellationReasonBreakdown(BaseModel):
