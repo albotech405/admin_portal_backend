@@ -6,8 +6,10 @@ from app.core.supabase import (
     get_supabase, count_of, call_rpc, first_row, rpc_missing,
     IN_FILTER_CHUNK as _IN_FILTER_CHUNK,
 )
+from app.services.config.router import _get_config_value
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
+import json
 import logging
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
@@ -352,6 +354,23 @@ def get_driver_locations(
 
 _HEATMAP_ROW_CAP = 50_000  # safety cap for the client-side fallback, same idiom as customer_wallet._METRICS_ROW_CAP
 
+# V2 geographic localization constants (Heatmap V2 -- viewport/zoom/operating-area).
+_ZOOM_BASE_GRID_DEG = 0.5   # grid cell size in degrees at zoom 0 (whole-world view)
+_GRID_SIZE_MIN = 0.001      # matches the existing Query(ge=0.001) bound
+_GRID_SIZE_MAX = 0.5        # matches the existing Query(le=0.5) bound
+_DEFAULT_GRID_SIZE_DEG = 0.01  # V1's literal default, used when grid_size_deg and zoom are both omitted
+
+_FALLBACK_OPERATING_AREA_BBOX = {
+    # Failsafe only, used if app_config has no default_operating_area_bbox row.
+    # Approximate Kinshasa-metro bounds, confirmed with the user as a starting
+    # estimate (2026-08-26) -- tighten via a direct UPDATE on that app_config row
+    # as real coverage data becomes available. Not a precise administrative boundary,
+    # and never referenced by name (DRC/Kinshasa) anywhere else in this endpoint's
+    # logic -- only this seeded value is DRC-specific, so the mechanism generalizes
+    # to any future city/country by updating the config row.
+    "north": -4.20, "south": -4.50, "east": 15.40, "west": 15.15,
+}
+
 
 def _bucket(value: float, grid_size: float) -> float:
     return round(round(value / grid_size) * grid_size, 6)
@@ -374,11 +393,61 @@ def _lat_lng_from_point(value: Any) -> Optional[tuple]:
         return None
 
 
+def _grid_size_from_zoom(zoom: int) -> float:
+    """Slippy-map-style doubling: each +1 zoom level halves the cell size.
+    Clamped to the existing [_GRID_SIZE_MIN, _GRID_SIZE_MAX] bounds so cell
+    counts can't explode at high zoom."""
+    raw = _ZOOM_BASE_GRID_DEG / (2 ** max(zoom, 0))
+    return round(min(max(raw, _GRID_SIZE_MIN), _GRID_SIZE_MAX), 6)
+
+
+def _resolve_grid_size(grid_size_deg: Optional[float], zoom: Optional[int]) -> float:
+    """Explicit grid_size_deg always wins over zoom. If both are omitted, fall
+    back to the literal V1 default (0.01) -- byte-identical to V1 behavior."""
+    if grid_size_deg is not None:
+        return grid_size_deg
+    if zoom is not None:
+        return _grid_size_from_zoom(zoom)
+    return _DEFAULT_GRID_SIZE_DEG
+
+
+def _resolve_time_window(days: int, minutes: Optional[int]) -> timedelta:
+    """minutes always wins over days when present -- covers all of the sub-day
+    presets (15/30/60/180/1440/10080/43200 minutes) with one flexible param."""
+    if minutes is not None:
+        return timedelta(minutes=minutes)
+    return timedelta(days=days)
+
+
+def _validate_viewport(north: float, south: float, east: float, west: float) -> None:
+    if north <= south:
+        raise HTTPException(status_code=400, detail="north must be greater than south")
+    if east <= west:
+        raise HTTPException(status_code=400, detail="east must be greater than west")
+
+
+def _compute_imbalance(demand_count: int, supply_count: int) -> int:
+    return demand_count - supply_count
+
+
+def _get_default_operating_area_bbox(sb) -> dict:
+    raw = _get_config_value(sb, "default_operating_area_bbox", "")
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if all(k in parsed for k in ("north", "south", "east", "west")):
+                return {k: float(parsed[k]) for k in ("north", "south", "east", "west")}
+        except (ValueError, TypeError, KeyError):
+            pass
+    return dict(_FALLBACK_OPERATING_AREA_BBOX)
+
+
 class HeatmapCell(BaseModel):
     grid_lat: float
     grid_lng: float
     demand_count: int = 0
     supply_count: int = 0
+    imbalance: int = 0  # demand_count - supply_count, computed server-side from the two authoritative counts
 
 
 class HeatmapResponse(BaseModel):
@@ -390,15 +459,25 @@ class HeatmapResponse(BaseModel):
     demand_points_skipped: int = 0
     supply_points_included: int = 0
     cells: List[HeatmapCell] = []
+    minutes: Optional[int] = None    # echo of the effective sub-day window, if used
+    zoom: Optional[int] = None       # echo of the requested zoom level, if used
+    viewport: Optional[dict] = None  # echo of the bbox actually applied (explicit or default-area), or None
 
 
 @router.get("/admin/heatmap", response_model=HeatmapResponse)
 def get_heatmap(
-    days: int = Query(7, description="Days of ride_requests/rides history for demand counts"),
+    days: int = Query(7, description="Days of ride_requests/rides history for demand counts (used only if `minutes` is omitted)"),
+    minutes: Optional[int] = Query(None, ge=1, le=43200, description="Sub-day/overriding time window in minutes (e.g. 15/30/60/180/1440/10080/43200). Overrides `days` when present."),
     source: str = Query("requests", description="Demand source: 'requests' (ride_requests) or 'rides' (historical)"),
     category: Optional[str] = Query(None, description="Filter: standard/premium/lady_driver"),
     vehicle_type: Optional[str] = Query(None, description="Filter: car/moto/tuk_tuk/van/suv"),
-    grid_size_deg: float = Query(0.01, ge=0.001, le=0.5, description="Grid cell size in degrees (~0.01 ≈ 1.1km)"),
+    grid_size_deg: Optional[float] = Query(None, ge=0.001, le=0.5, description="Explicit grid cell size in degrees. Overrides zoom-derived size when given. Defaults to 0.01 (~1.1km) if grid_size_deg and zoom are both omitted."),
+    zoom: Optional[int] = Query(None, ge=0, le=20, description="Map zoom level, mapped server-side to grid_size_deg when grid_size_deg is not explicitly given."),
+    north: Optional[float] = Query(None, ge=-90, le=90, description="Viewport bbox north latitude bound. Must be given together with south/east/west."),
+    south: Optional[float] = Query(None, ge=-90, le=90, description="Viewport bbox south latitude bound."),
+    east: Optional[float] = Query(None, ge=-180, le=180, description="Viewport bbox east longitude bound."),
+    west: Optional[float] = Query(None, ge=-180, le=180, description="Viewport bbox west longitude bound."),
+    use_default_area: bool = Query(False, description="When true and no explicit viewport is given, apply the configured default operating-area bbox (app_config key default_operating_area_bbox)."),
     _user=Depends(require_admin),
 ):
     """
@@ -406,16 +485,44 @@ def get_heatmap(
     (driver_profiles lat/lng) counts, for an ops hotspot/heatmap view.
 
     Prefers the get_admin_heatmap Postgres RPC (grid-bucketing done
-    server-side, see sql/20260825_heatmap_rpc.sql) so cell counts are correct
+    server-side, see sql/20260825_heatmap_rpc.sql and
+    sql/20260826_heatmap_v2_viewport_zoom.sql) so cell counts are correct
     regardless of table size. Falls back to a capped client-side bucketing
-    pass (see _HEATMAP_ROW_CAP) only if that migration hasn't been applied
+    pass (see _HEATMAP_ROW_CAP) only if those migrations haven't been applied
     yet -- that fallback path can silently under-report once row volume
-    exceeds the cap.
+    exceeds the cap, and cannot push viewport filtering into the demand-side
+    query (picking_point is opaque JSON, not a queryable column via PostgREST)
+    so it filters after per-row coordinate extraction instead.
+
+    V2 additions (all optional, default to reproducing V1 behavior exactly):
+    - `minutes` for sub-day time windows, overriding `days` when given.
+    - `zoom` for zoom-aware grid resolution, overridden by explicit `grid_size_deg`.
+    - `north`/`south`/`east`/`west` viewport bbox filtering (all four required together).
+    - `use_default_area` to apply the configured operating-area bbox
+      (app_config key `default_operating_area_bbox`) when no explicit viewport
+      is given -- the mechanism is country-agnostic; only the seeded config
+      value is DRC-specific.
+    - `imbalance` on each cell (demand_count - supply_count).
     """
+    viewport_params = (north, south, east, west)
+    given_count = sum(1 for v in viewport_params if v is not None)
+    if given_count not in (0, 4):
+        raise HTTPException(status_code=400, detail="north, south, east, west must all be provided together")
+    if given_count == 4:
+        _validate_viewport(north, south, east, west)
+
     demand_table = "rides" if source == "rides" else "requests"
     sb = get_supabase()
     admin_id = (_user or {}).get("id")
     generated_at = datetime.now(timezone.utc).isoformat()
+
+    effective_grid_size = _resolve_grid_size(grid_size_deg, zoom)
+
+    effective_viewport: Optional[dict] = None
+    if given_count == 4:
+        effective_viewport = {"north": north, "south": south, "east": east, "west": west}
+    elif use_default_area:
+        effective_viewport = _get_default_operating_area_bbox(sb)
 
     if admin_id:
         try:
@@ -425,28 +532,46 @@ def get_heatmap(
                 "p_source": demand_table,
                 "p_category": category,
                 "p_vehicle_type": vehicle_type,
-                "p_grid_size": grid_size_deg,
+                "p_grid_size": effective_grid_size,
+                "p_minutes": minutes,
+                "p_north": effective_viewport["north"] if effective_viewport else None,
+                "p_south": effective_viewport["south"] if effective_viewport else None,
+                "p_east": effective_viewport["east"] if effective_viewport else None,
+                "p_west": effective_viewport["west"] if effective_viewport else None,
             }))
             if result:
                 return HeatmapResponse(
                     generated_at=generated_at,
-                    grid_size_deg=grid_size_deg,
+                    grid_size_deg=effective_grid_size,
                     source=demand_table,
                     days=days,
                     demand_points_included=result.get("demand_points_included", 0),
                     demand_points_skipped=result.get("demand_points_skipped", 0),
                     supply_points_included=result.get("supply_points_included", 0),
-                    cells=[HeatmapCell(**c) for c in (result.get("cells") or [])],
+                    cells=[
+                        HeatmapCell(
+                            grid_lat=c.get("grid_lat"),
+                            grid_lng=c.get("grid_lng"),
+                            demand_count=c.get("demand_count", 0),
+                            supply_count=c.get("supply_count", 0),
+                            imbalance=_compute_imbalance(c.get("demand_count", 0), c.get("supply_count", 0)),
+                        )
+                        for c in (result.get("cells") or [])
+                    ],
+                    minutes=minutes,
+                    zoom=zoom,
+                    viewport=effective_viewport,
                 )
         except Exception as e:
             if not rpc_missing(e):
                 raise HTTPException(status_code=500, detail=str(e))
             logger.warning(
                 "get_admin_heatmap RPC not found, falling back to capped "
-                "client-side grid bucketing. Apply sql/20260825_heatmap_rpc.sql."
+                "client-side grid bucketing. Apply sql/20260825_heatmap_rpc.sql "
+                "and sql/20260826_heatmap_v2_viewport_zoom.sql."
             )
 
-    cutoff_str = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    cutoff_str = (datetime.now(timezone.utc) - _resolve_time_window(days, minutes)).isoformat()
     table_name = "rides" if demand_table == "rides" else "ride_requests"
 
     try:
@@ -477,6 +602,14 @@ def get_heatmap(
             supply_query = supply_query.eq("category", category)
         if vehicle_type:
             supply_query = supply_query.eq("vehicle_type", vehicle_type)
+        if effective_viewport:
+            supply_query = (
+                supply_query
+                .gte("latitude", effective_viewport["south"])
+                .lte("latitude", effective_viewport["north"])
+                .gte("longitude", effective_viewport["west"])
+                .lte("longitude", effective_viewport["east"])
+            )
         supply_rows = supply_query.execute().data or []
     except Exception:
         supply_rows = []
@@ -491,7 +624,15 @@ def get_heatmap(
             demand_skipped += 1
             continue
         lat, lng = point
-        key = (_bucket(lat, grid_size_deg), _bucket(lng, grid_size_deg))
+        # picking_point is opaque JSON -- not a queryable column via PostgREST --
+        # so viewport filtering for demand can only happen here, after per-row
+        # extraction, rather than pushed into the .select() query above.
+        if effective_viewport and not (
+            effective_viewport["south"] <= lat <= effective_viewport["north"]
+            and effective_viewport["west"] <= lng <= effective_viewport["east"]
+        ):
+            continue
+        key = (_bucket(lat, effective_grid_size), _bucket(lng, effective_grid_size))
         cell_map.setdefault(key, {"demand": 0, "supply": 0})
         cell_map[key]["demand"] += 1
         demand_included += 1
@@ -502,25 +643,32 @@ def get_heatmap(
             lat, lng = float(row["latitude"]), float(row["longitude"])
         except (TypeError, ValueError, KeyError):
             continue
-        key = (_bucket(lat, grid_size_deg), _bucket(lng, grid_size_deg))
+        key = (_bucket(lat, effective_grid_size), _bucket(lng, effective_grid_size))
         cell_map.setdefault(key, {"demand": 0, "supply": 0})
         cell_map[key]["supply"] += 1
         supply_included += 1
 
     cells = [
-        HeatmapCell(grid_lat=k[0], grid_lng=k[1], demand_count=v["demand"], supply_count=v["supply"])
+        HeatmapCell(
+            grid_lat=k[0], grid_lng=k[1],
+            demand_count=v["demand"], supply_count=v["supply"],
+            imbalance=_compute_imbalance(v["demand"], v["supply"]),
+        )
         for k, v in cell_map.items()
     ]
 
     return HeatmapResponse(
         generated_at=generated_at,
-        grid_size_deg=grid_size_deg,
+        grid_size_deg=effective_grid_size,
         source=demand_table,
         days=days,
         demand_points_included=demand_included,
         demand_points_skipped=demand_skipped,
         supply_points_included=supply_included,
         cells=cells,
+        minutes=minutes,
+        zoom=zoom,
+        viewport=effective_viewport,
     )
 
 

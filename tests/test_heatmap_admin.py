@@ -1,10 +1,31 @@
+# NOTE: This suite covers pure functions (grid bucketing, zoom mapping, viewport
+# validation, time-window resolution, imbalance math, operating-area fallback
+# parsing) and Pydantic model defaults only, per this repo's existing
+# unittest-on-pure-functions convention (no live-DB mocking framework exists here).
+# Full behavioral coverage of the RPC/fallback paths against real
+# ride_requests/rides/driver_profiles rows (empty-area results, demand-only vs
+# supply-only cells from real data, category/vehicle_type filtering against real
+# rows, viewport pushdown correctness under load) requires live Supabase access,
+# which this session/environment does not have. No performance/timing numbers are
+# asserted anywhere in this file for the same reason.
+
 import unittest
+from datetime import timedelta
+from fastapi import HTTPException
 
 from app.services.analytics.router import (
     HeatmapCell,
     HeatmapResponse,
     _bucket,
     _lat_lng_from_point,
+    _grid_size_from_zoom,
+    _resolve_grid_size,
+    _resolve_time_window,
+    _validate_viewport,
+    _compute_imbalance,
+    _get_default_operating_area_bbox,
+    _FALLBACK_OPERATING_AREA_BBOX,
+    _DEFAULT_GRID_SIZE_DEG,
 )
 from app.core.supabase import rpc_missing
 
@@ -66,6 +87,151 @@ class HeatmapRpcMissingTests(unittest.TestCase):
             '{"code":"PGRST202","message":"Could not find the function public.get_admin_heatmap"}'
         )))
         self.assertFalse(rpc_missing(Exception("connection refused")))
+
+
+class ZoomToGridSizeTests(unittest.TestCase):
+    def test_zoom_zero_maps_to_base_grid_size(self) -> None:
+        self.assertEqual(_grid_size_from_zoom(0), 0.5)
+
+    def test_higher_zoom_yields_smaller_grid(self) -> None:
+        self.assertGreater(_grid_size_from_zoom(1), _grid_size_from_zoom(2))
+        self.assertGreater(_grid_size_from_zoom(2), _grid_size_from_zoom(3))
+
+    def test_zoom_clamped_to_minimum_grid_size(self) -> None:
+        self.assertEqual(_grid_size_from_zoom(10), 0.001)
+        self.assertEqual(_grid_size_from_zoom(20), 0.001)
+
+    def test_negative_zoom_does_not_exceed_maximum_grid_size(self) -> None:
+        self.assertLessEqual(_grid_size_from_zoom(-5), 0.5)
+
+
+class ResolveGridSizeTests(unittest.TestCase):
+    def test_explicit_grid_size_deg_wins_over_zoom(self) -> None:
+        self.assertEqual(_resolve_grid_size(0.05, 10), 0.05)
+
+    def test_zoom_used_when_grid_size_deg_absent(self) -> None:
+        self.assertEqual(_resolve_grid_size(None, 1), _grid_size_from_zoom(1))
+
+    def test_default_v1_grid_size_when_both_absent(self) -> None:
+        self.assertEqual(_resolve_grid_size(None, None), _DEFAULT_GRID_SIZE_DEG)
+        self.assertEqual(_resolve_grid_size(None, None), 0.01)
+
+
+class ResolveTimeWindowTests(unittest.TestCase):
+    def test_minutes_overrides_days_when_present(self) -> None:
+        self.assertEqual(_resolve_time_window(7, 30), timedelta(minutes=30))
+
+    def test_days_used_when_minutes_absent(self) -> None:
+        self.assertEqual(_resolve_time_window(7, None), timedelta(days=7))
+
+    def test_sub_day_presets(self) -> None:
+        for preset_minutes in (15, 30, 60, 180, 1440, 10080, 43200):
+            self.assertEqual(_resolve_time_window(7, preset_minutes), timedelta(minutes=preset_minutes))
+
+
+class ViewportValidationTests(unittest.TestCase):
+    def test_valid_viewport_passes(self) -> None:
+        _validate_viewport(north=2, south=1, east=4, west=3)  # should not raise
+
+    def test_north_less_than_or_equal_south_rejected(self) -> None:
+        with self.assertRaises(HTTPException) as ctx:
+            _validate_viewport(north=1, south=2, east=4, west=3)
+        self.assertEqual(ctx.exception.status_code, 400)
+
+        with self.assertRaises(HTTPException):
+            _validate_viewport(north=1, south=1, east=4, west=3)
+
+    def test_east_less_than_or_equal_west_rejected(self) -> None:
+        with self.assertRaises(HTTPException) as ctx:
+            _validate_viewport(north=2, south=1, east=3, west=4)
+        self.assertEqual(ctx.exception.status_code, 400)
+
+        with self.assertRaises(HTTPException):
+            _validate_viewport(north=2, south=1, east=3, west=3)
+
+
+class ImbalanceComputationTests(unittest.TestCase):
+    def test_positive_imbalance_when_demand_exceeds_supply(self) -> None:
+        self.assertEqual(_compute_imbalance(20, 5), 15)
+
+    def test_negative_imbalance_when_supply_exceeds_demand(self) -> None:
+        self.assertEqual(_compute_imbalance(2, 10), -8)
+
+    def test_zero_imbalance_when_equal(self) -> None:
+        self.assertEqual(_compute_imbalance(5, 5), 0)
+
+    def test_imbalance_with_demand_only_cell(self) -> None:
+        self.assertEqual(_compute_imbalance(7, 0), 7)
+
+    def test_imbalance_with_supply_only_cell(self) -> None:
+        self.assertEqual(_compute_imbalance(0, 4), -4)
+
+
+class _FakeMaybeSingleResult:
+    def __init__(self, data):
+        self.data = data
+
+
+class _FakeConfigQuery:
+    def __init__(self, row):
+        self._row = row
+
+    def select(self, *_args, **_kwargs):
+        return self
+
+    def eq(self, *_args, **_kwargs):
+        return self
+
+    def maybe_single(self):
+        return self
+
+    def execute(self):
+        return _FakeMaybeSingleResult(self._row)
+
+
+class _FakeSupabaseClient:
+    """Minimal stand-in for the parts of the Supabase client that
+    _get_config_value touches, so _get_default_operating_area_bbox can be
+    tested without live Supabase access (none exists in this environment)."""
+
+    def __init__(self, row):
+        self._row = row
+
+    def table(self, _name):
+        return _FakeConfigQuery(self._row)
+
+
+class OperatingAreaDefaultTests(unittest.TestCase):
+    def test_fallback_bbox_used_when_config_value_missing(self) -> None:
+        sb = _FakeSupabaseClient(row=None)
+        self.assertEqual(_get_default_operating_area_bbox(sb), _FALLBACK_OPERATING_AREA_BBOX)
+
+    def test_configured_bbox_parsed_from_json_string(self) -> None:
+        sb = _FakeSupabaseClient(row={"value": '{"north": 1.0, "south": 0.0, "east": 2.0, "west": -1.0}'})
+        self.assertEqual(
+            _get_default_operating_area_bbox(sb),
+            {"north": 1.0, "south": 0.0, "east": 2.0, "west": -1.0},
+        )
+
+    def test_malformed_config_json_falls_back_to_constant(self) -> None:
+        sb = _FakeSupabaseClient(row={"value": "not-json"})
+        self.assertEqual(_get_default_operating_area_bbox(sb), _FALLBACK_OPERATING_AREA_BBOX)
+
+    def test_incomplete_config_json_falls_back_to_constant(self) -> None:
+        sb = _FakeSupabaseClient(row={"value": '{"north": 1.0}'})
+        self.assertEqual(_get_default_operating_area_bbox(sb), _FALLBACK_OPERATING_AREA_BBOX)
+
+
+class HeatmapCellV2ModelTests(unittest.TestCase):
+    def test_heatmap_cell_imbalance_defaults_to_zero(self) -> None:
+        cell = HeatmapCell(grid_lat=-4.32, grid_lng=15.31)
+        self.assertEqual(cell.imbalance, 0)
+
+    def test_heatmap_response_v2_optional_fields_default_to_none(self) -> None:
+        resp = HeatmapResponse()
+        self.assertIsNone(resp.minutes)
+        self.assertIsNone(resp.zoom)
+        self.assertIsNone(resp.viewport)
 
 
 if __name__ == "__main__":
