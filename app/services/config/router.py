@@ -1,6 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from typing import Optional
+from typing import List, Optional
 from app.core.dependencies import require_admin
 from app.core.supabase import get_supabase
 from app.services.audit.router import write_audit_log
@@ -117,3 +117,59 @@ def update_app_toggles(body: UpdateAppConfigBody, _user=Depends(require_admin)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Operating-area discovery ─────────────────────────────────────────────
+#
+# Backend-owned country -> city -> operating-area hierarchy (public.service_areas,
+# see sql/20260827_service_areas.sql) so the Admin Frontend can discover
+# configured markets/cities/areas without any location ever being hardcoded in
+# frontend code. Read-only: adding a future country/city/area is a config-row
+# insert, never a frontend deploy. Also consumed by GET /analytics/admin/heatmap's
+# optional service_area_id param (app/services/analytics/router.py).
+
+
+class ServiceAreaItem(BaseModel):
+    id: str
+    country_code: str
+    country_name: str
+    city: str
+    area_name: str
+    is_active: bool = True
+    north: float
+    south: float
+    east: float
+    west: float
+
+
+class ServiceAreasResponse(BaseModel):
+    areas: List[ServiceAreaItem] = []
+
+
+@router.get("/admin/service-areas", response_model=ServiceAreasResponse)
+def get_service_areas(
+    include_inactive: bool = Query(False, description="When true, include areas with is_active=false. Defaults to active-only."),
+    _user=Depends(require_admin),
+):
+    """
+    List configured operating areas (country/city/area hierarchy + bbox), for
+    the Admin Frontend's Heatmap location selector and similar UI.
+
+    Defaults to active areas only -- pass include_inactive=true to also see
+    disabled areas (e.g. for a future admin-management view). A single direct
+    table read, no joins, no aggregation -- this data is small and rarely
+    changes, unlike Heatmap's own RPC-backed aggregation over ride/driver
+    activity tables.
+    """
+    try:
+        sb = get_supabase()
+        query = sb.table("service_areas").select(
+            "id, country_code, country_name, city, area_name, is_active, north, south, east, west"
+        )
+        if not include_inactive:
+            query = query.eq("is_active", True)
+        rows = query.execute().data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return ServiceAreasResponse(areas=[ServiceAreaItem(**row) for row in rows])

@@ -442,6 +442,36 @@ def _get_default_operating_area_bbox(sb) -> dict:
     return dict(_FALLBACK_OPERATING_AREA_BBOX)
 
 
+def _bbox_from_service_area_row(row: dict) -> dict:
+    """Shape a public.service_areas row (north/south/east/west columns) into the
+    same bbox dict shape used by explicit viewport params and
+    _get_default_operating_area_bbox. Pure/no I/O so it's directly unit-testable;
+    the row's own CHECK (north > south AND east > west) constraint means a stored
+    row can never violate the viewport invariant, so no extra validation is
+    needed here."""
+    return {k: float(row[k]) for k in ("north", "south", "east", "west")}
+
+
+def _resolve_service_area_bbox(sb, service_area_id: str) -> dict:
+    """Look up a public.service_areas row by id and return its bbox. Raises 404
+    if no such area exists -- a lookup-by-id-not-found case, distinct from the
+    400 _validate_viewport raises for malformed explicit viewport bounds.
+    Does NOT filter by is_active: a previously-valid service_area_id should
+    still resolve even if the area was later deactivated (deactivation controls
+    whether an area is *offered* in GET /config/admin/service-areas, not
+    whether a known id can still be queried here)."""
+    result = (
+        sb.table("service_areas")
+        .select("north, south, east, west")
+        .eq("id", service_area_id)
+        .maybe_single()
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail=f"service_area_id '{service_area_id}' not found")
+    return _bbox_from_service_area_row(result.data)
+
+
 class HeatmapCell(BaseModel):
     grid_lat: float
     grid_lng: float
@@ -477,7 +507,8 @@ def get_heatmap(
     south: Optional[float] = Query(None, ge=-90, le=90, description="Viewport bbox south latitude bound."),
     east: Optional[float] = Query(None, ge=-180, le=180, description="Viewport bbox east longitude bound."),
     west: Optional[float] = Query(None, ge=-180, le=180, description="Viewport bbox west longitude bound."),
-    use_default_area: bool = Query(False, description="When true and no explicit viewport is given, apply the configured default operating-area bbox (app_config key default_operating_area_bbox)."),
+    use_default_area: bool = Query(False, description="When true and no explicit viewport or service_area_id is given, apply the configured default operating-area bbox (app_config key default_operating_area_bbox)."),
+    service_area_id: Optional[str] = Query(None, description="Look up a configured service_areas row (see GET /config/admin/service-areas) by id and use its bbox as the viewport. Takes precedence over use_default_area, but explicit north/south/east/west still wins."),
     _user=Depends(require_admin),
 ):
     """
@@ -503,6 +534,14 @@ def get_heatmap(
       is given -- the mechanism is country-agnostic; only the seeded config
       value is DRC-specific.
     - `imbalance` on each cell (demand_count - supply_count).
+
+    V2.1 addition: `service_area_id` resolves a configured public.service_areas
+    row (see GET /config/admin/service-areas) to a bbox, so the frontend can
+    request "Kinshasa" or any future configured city/area without ever sending
+    or hardcoding its coordinates. Viewport precedence, most to least specific:
+    explicit north/south/east/west > service_area_id > use_default_area > none.
+    An unknown service_area_id is a 404, distinct from the 400 used for
+    malformed explicit viewport bounds.
     """
     viewport_params = (north, south, east, west)
     given_count = sum(1 for v in viewport_params if v is not None)
@@ -521,6 +560,8 @@ def get_heatmap(
     effective_viewport: Optional[dict] = None
     if given_count == 4:
         effective_viewport = {"north": north, "south": south, "east": east, "west": west}
+    elif service_area_id:
+        effective_viewport = _resolve_service_area_bbox(sb, service_area_id)
     elif use_default_area:
         effective_viewport = _get_default_operating_area_bbox(sb)
 
