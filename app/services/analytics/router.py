@@ -430,6 +430,32 @@ def _compute_imbalance(demand_count: int, supply_count: int) -> int:
     return demand_count - supply_count
 
 
+_TREND_STABLE_THRESHOLD_PCT = 10.0  # |pct| < 10% => "stable"; >= +10% => "increasing"; <= -10% => "decreasing"
+
+
+def _compute_cancellation_rate(cancelled: int, total: int) -> Optional[float]:
+    """cancelled/total as a fraction, rounded to 4dp. None on empty denominator
+    (total <= 0) -- an empty cell has no rate, not a fabricated 0% rate."""
+    if total <= 0:
+        return None
+    return round(cancelled / total, 4)
+
+
+def _compute_demand_trend(current: int, previous: int) -> tuple:
+    """Pct change previous->current. previous <= 0 is undefined -> (None, None),
+    never a fabricated infinite/zero value. Threshold-based label."""
+    if previous <= 0:
+        return None, None
+    pct = round(((current - previous) / previous) * 100, 2)
+    if pct >= _TREND_STABLE_THRESHOLD_PCT:
+        label = "increasing"
+    elif pct <= -_TREND_STABLE_THRESHOLD_PCT:
+        label = "decreasing"
+    else:
+        label = "stable"
+    return pct, label
+
+
 def _get_default_operating_area_bbox(sb) -> dict:
     raw = _get_config_value(sb, "default_operating_area_bbox", "")
     if raw:
@@ -478,6 +504,50 @@ class HeatmapCell(BaseModel):
     demand_count: int = 0
     supply_count: int = 0
     imbalance: int = 0  # demand_count - supply_count, computed server-side from the two authoritative counts
+    # V3 operational-intelligence fields. All Optional/None by default -- never a
+    # fabricated 0. cancellation_count/cancellation_rate are only populated when
+    # source="rides" (ride_requests has no cancelled_at); demand_trend_pct/label
+    # are populated for either source when a previous-period comparison exists.
+    cancellation_count: Optional[int] = None
+    cancellation_rate: Optional[float] = None
+    demand_trend_pct: Optional[float] = None
+    demand_trend_label: Optional[str] = None
+
+
+def _build_heatmap_cells_from_rpc(raw_cells: list, demand_table: str) -> "List[HeatmapCell]":
+    """Map get_admin_heatmap's raw jsonb cells into HeatmapCell objects,
+    applying V3's derived fields. cancellation_count/cancellation_rate are only
+    set when demand_table == "rides" (the RPC never populates them otherwise --
+    see sql/20260828_heatmap_v3_operational_intelligence.sql's NULL-vs-0 note).
+    A cell with source="rides" and genuinely zero cancellations comes back from
+    the RPC as SQL NULL (no grouped row for that cell) -- `or 0` here is what
+    turns "no row" into the correct "0 cancellations", but only on this branch,
+    so a source="requests" cell's cancellation_count stays None (not 0)."""
+    cells = []
+    for c in raw_cells:
+        demand_count = c.get("demand_count", 0)
+        supply_count = c.get("supply_count", 0)
+        prev_demand_count = c.get("prev_demand_count", 0)
+        trend_pct, trend_label = _compute_demand_trend(demand_count, prev_demand_count)
+
+        cancellation_count: Optional[int] = None
+        cancellation_rate: Optional[float] = None
+        if demand_table == "rides":
+            cancellation_count = c.get("cancellation_count") or 0
+            cancellation_rate = _compute_cancellation_rate(cancellation_count, demand_count)
+
+        cells.append(HeatmapCell(
+            grid_lat=c.get("grid_lat"),
+            grid_lng=c.get("grid_lng"),
+            demand_count=demand_count,
+            supply_count=supply_count,
+            imbalance=_compute_imbalance(demand_count, supply_count),
+            cancellation_count=cancellation_count,
+            cancellation_rate=cancellation_rate,
+            demand_trend_pct=trend_pct,
+            demand_trend_label=trend_label,
+        ))
+    return cells
 
 
 class HeatmapResponse(BaseModel):
@@ -492,6 +562,7 @@ class HeatmapResponse(BaseModel):
     minutes: Optional[int] = None    # echo of the effective sub-day window, if used
     zoom: Optional[int] = None       # echo of the requested zoom level, if used
     viewport: Optional[dict] = None  # echo of the bbox actually applied (explicit or default-area), or None
+    geographic_scope: Optional[str] = None  # "service_area" / "default_area" / "custom_viewport" / "unscoped"
 
 
 @router.get("/admin/heatmap", response_model=HeatmapResponse)
@@ -542,6 +613,24 @@ def get_heatmap(
     explicit north/south/east/west > service_area_id > use_default_area > none.
     An unknown service_area_id is a 404, distinct from the 400 used for
     malformed explicit viewport bounds.
+
+    V3 additions (see sql/20260828_heatmap_v3_operational_intelligence.sql):
+    - `geographic_scope` on the response echoes which viewport-resolution
+      mechanism was actually used ("custom_viewport"/"service_area"/
+      "default_area"/"unscoped") -- derived purely from the precedence branch
+      above, no new query.
+    - `cancellation_count`/`cancellation_rate` per cell, only when
+      `source=rides` (ride_requests has no cancelled_at). None (not 0) when
+      not applicable or when a cell's total is 0.
+    - `demand_trend_pct`/`demand_trend_label` per cell, comparing the current
+      window's demand to the immediately preceding equivalent window. None
+      when the previous period had no demand (undefined trend).
+    - Average wait time is intentionally NOT exposed: no timestamp anywhere in
+      this schema marks when a driver accepted/was matched to a request
+      (`driver_responses.created_at` marks bid placement, not acceptance), so
+      no meaningful wait-time metric can be computed without fabricating data.
+    - V3 fields are RPC-only -- the Python fallback path leaves them at their
+      Optional/None defaults (see the fallback's own code comment for why).
     """
     viewport_params = (north, south, east, west)
     given_count = sum(1 for v in viewport_params if v is not None)
@@ -560,10 +649,15 @@ def get_heatmap(
     effective_viewport: Optional[dict] = None
     if given_count == 4:
         effective_viewport = {"north": north, "south": south, "east": east, "west": west}
+        geographic_scope = "custom_viewport"
     elif service_area_id:
         effective_viewport = _resolve_service_area_bbox(sb, service_area_id)
+        geographic_scope = "service_area"
     elif use_default_area:
         effective_viewport = _get_default_operating_area_bbox(sb)
+        geographic_scope = "default_area"
+    else:
+        geographic_scope = "unscoped"
 
     if admin_id:
         try:
@@ -589,19 +683,11 @@ def get_heatmap(
                     demand_points_included=result.get("demand_points_included", 0),
                     demand_points_skipped=result.get("demand_points_skipped", 0),
                     supply_points_included=result.get("supply_points_included", 0),
-                    cells=[
-                        HeatmapCell(
-                            grid_lat=c.get("grid_lat"),
-                            grid_lng=c.get("grid_lng"),
-                            demand_count=c.get("demand_count", 0),
-                            supply_count=c.get("supply_count", 0),
-                            imbalance=_compute_imbalance(c.get("demand_count", 0), c.get("supply_count", 0)),
-                        )
-                        for c in (result.get("cells") or [])
-                    ],
+                    cells=_build_heatmap_cells_from_rpc(result.get("cells") or [], demand_table),
                     minutes=minutes,
                     zoom=zoom,
                     viewport=effective_viewport,
+                    geographic_scope=geographic_scope,
                 )
         except Exception as e:
             if not rpc_missing(e):
@@ -689,6 +775,13 @@ def get_heatmap(
         cell_map[key]["supply"] += 1
         supply_included += 1
 
+    # V3 fields (cancellation_count/rate, demand_trend_pct/label) are deliberately
+    # NOT computed in this fallback path -- each would need its own second
+    # _HEATMAP_ROW_CAP-capped bucketing pass over the same already-degraded row
+    # set (this fallback only runs when the RPC migration hasn't been applied),
+    # compounding the under-reporting risk this fallback already discloses for
+    # demand/supply. They stay at their Optional/None defaults here; the RPC
+    # path (_build_heatmap_cells_from_rpc) is the only source of real values.
     cells = [
         HeatmapCell(
             grid_lat=k[0], grid_lng=k[1],
@@ -709,6 +802,7 @@ def get_heatmap(
         cells=cells,
         minutes=minutes,
         zoom=zoom,
+        geographic_scope=geographic_scope,
         viewport=effective_viewport,
     )
 

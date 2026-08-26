@@ -26,6 +26,8 @@ from app.services.analytics.router import (
     _get_default_operating_area_bbox,
     _FALLBACK_OPERATING_AREA_BBOX,
     _DEFAULT_GRID_SIZE_DEG,
+    _compute_cancellation_rate,
+    _compute_demand_trend,
 )
 from app.core.supabase import rpc_missing
 
@@ -232,6 +234,78 @@ class HeatmapCellV2ModelTests(unittest.TestCase):
         self.assertIsNone(resp.minutes)
         self.assertIsNone(resp.zoom)
         self.assertIsNone(resp.viewport)
+
+
+class CancellationRateTests(unittest.TestCase):
+    def test_normal_fraction(self) -> None:
+        self.assertEqual(_compute_cancellation_rate(3, 10), 0.3)
+
+    def test_zero_cancellations_nonzero_total_is_zero_not_none(self) -> None:
+        self.assertEqual(_compute_cancellation_rate(0, 10), 0.0)
+
+    def test_empty_denominator_returns_none(self) -> None:
+        self.assertIsNone(_compute_cancellation_rate(0, 0))
+
+    def test_nonzero_cancelled_zero_total_returns_none(self) -> None:
+        # Shouldn't happen in practice (cancelled <= total always), but the
+        # denominator guard must not divide by zero regardless.
+        self.assertIsNone(_compute_cancellation_rate(2, 0))
+
+    def test_negative_total_returns_none(self) -> None:
+        self.assertIsNone(_compute_cancellation_rate(0, -1))
+
+
+class DemandTrendTests(unittest.TestCase):
+    def test_increasing_beyond_threshold(self) -> None:
+        pct, label = _compute_demand_trend(15, 10)
+        self.assertEqual(pct, 50.0)
+        self.assertEqual(label, "increasing")
+
+    def test_decreasing_beyond_threshold(self) -> None:
+        pct, label = _compute_demand_trend(5, 10)
+        self.assertEqual(pct, -50.0)
+        self.assertEqual(label, "decreasing")
+
+    def test_stable_within_band(self) -> None:
+        pct, label = _compute_demand_trend(105, 100)
+        self.assertEqual(pct, 5.0)
+        self.assertEqual(label, "stable")
+
+    def test_boundary_exactly_at_positive_threshold_is_increasing(self) -> None:
+        pct, label = _compute_demand_trend(110, 100)
+        self.assertEqual(pct, 10.0)
+        self.assertEqual(label, "increasing")
+
+    def test_boundary_exactly_at_negative_threshold_is_decreasing(self) -> None:
+        pct, label = _compute_demand_trend(90, 100)
+        self.assertEqual(pct, -10.0)
+        self.assertEqual(label, "decreasing")
+
+    def test_boundary_just_inside_threshold_is_stable(self) -> None:
+        pct, label = _compute_demand_trend(109, 100)
+        self.assertEqual(pct, 9.0)
+        self.assertEqual(label, "stable")
+
+    def test_zero_previous_period_is_undefined(self) -> None:
+        self.assertEqual(_compute_demand_trend(5, 0), (None, None))
+
+    def test_both_periods_zero_is_undefined(self) -> None:
+        self.assertEqual(_compute_demand_trend(0, 0), (None, None))
+
+
+class HeatmapCellV3ModelDefaultsTests(unittest.TestCase):
+    def test_v3_fields_default_to_none_not_zero(self) -> None:
+        cell = HeatmapCell(grid_lat=-4.32, grid_lng=15.31)
+        self.assertIsNone(cell.cancellation_count)
+        self.assertIsNone(cell.cancellation_rate)
+        self.assertIsNone(cell.demand_trend_pct)
+        self.assertIsNone(cell.demand_trend_label)
+
+
+class HeatmapResponseGeographicScopeTests(unittest.TestCase):
+    def test_geographic_scope_defaults_to_none(self) -> None:
+        resp = HeatmapResponse()
+        self.assertIsNone(resp.geographic_scope)
 
 
 if __name__ == "__main__":
