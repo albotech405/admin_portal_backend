@@ -18,7 +18,12 @@ class CustomerAdminItem(BaseModel):
     full_name: str
     phone_number: str
     email: Optional[str] = None
-    is_active: bool
+    is_active: bool = Field(
+        ...,
+        description="Canonical ban state: false means banned. There is no separate "
+        "ban_reason/banned_at/is_banned field anywhere in the schema -- is_active is "
+        "the sole representation of a customer's active/banned status.",
+    )
     is_admin: bool = False
     gender: Optional[str] = None
     profile_image_url: Optional[str] = None
@@ -35,6 +40,8 @@ class CustomerAdminItem(BaseModel):
 class CustomerAdminListResponse(BaseModel):
     customers: List[CustomerAdminItem]
     total: int
+    limit: Optional[int] = None
+    offset: int = 0
 
 
 class CustomerDetailResponse(CustomerAdminItem):
@@ -214,11 +221,13 @@ def create_customer(body: CreateCustomerRequest, _user: dict = Depends(require_r
 def list_customers(
     status: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
+    limit: Optional[int] = Query(None, ge=1, le=100, description="Page size; omit to return every match (existing behavior)."),
+    offset: int = Query(0, ge=0),
     _user=Depends(require_admin),
 ):
     try:
         sb = get_supabase()
-        query = sb.table("users").select("*").neq("role", "driver")
+        query = sb.table("users").select("*", count="exact").neq("role", "driver")
 
         if status == "active":
             query = query.eq("is_active", True)
@@ -230,9 +239,14 @@ def list_customers(
                 f"full_name.ilike.%{search}%,phone_number.ilike.%{search}%"
             )
 
-        result = query.order("created_at", desc=True).execute()
+        query = query.order("created_at", desc=True)
+        if limit is not None:
+            query = query.range(offset, offset + limit - 1)
+        result = query.execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    total_matched = result.count if result.count is not None else len(result.data or [])
 
     user_ids = [str(row.get("id")) for row in (result.data or []) if row.get("id")]
     try:
@@ -246,7 +260,7 @@ def list_customers(
         identity_fields = _customer_identity_fields(driver_link_map.get(str(r.get("id"))))
         customers.append(CustomerAdminItem(**row_fields, **identity_fields))
 
-    return CustomerAdminListResponse(customers=customers, total=len(customers))
+    return CustomerAdminListResponse(customers=customers, total=total_matched, limit=limit, offset=offset)
 
 
 @router.get("/admin/{user_id}", response_model=CustomerDetailResponse)
@@ -295,6 +309,10 @@ def get_customer_detail(user_id: str, _user=Depends(require_admin)):
 
 @router.patch("/admin/{user_id}/ban")
 def ban_customer(user_id: str, body: Optional[BanUnbanBody] = None, _user=Depends(require_admin)):
+    """Ban a customer by setting is_active=false -- this is the only ban
+    representation in the schema; there is no separate ban_reason/banned_at
+    column. `reason` (if given) is recorded only in the audit log, not persisted
+    on the users row."""
     try:
         sb = get_supabase()
         result = sb.table("users").update({"is_active": False}).eq("id", user_id).execute()
@@ -320,6 +338,8 @@ def ban_customer(user_id: str, body: Optional[BanUnbanBody] = None, _user=Depend
 
 @router.patch("/admin/{user_id}/unban")
 def unban_customer(user_id: str, _user=Depends(require_admin)):
+    """Unban a customer by setting is_active=true -- see ban_customer for the
+    canonical-ban-representation note."""
     try:
         sb = get_supabase()
         result = sb.table("users").update({"is_active": True}).eq("id", user_id).execute()

@@ -452,6 +452,18 @@ def create_driver(body: CreateDriverRequest, _user: dict = Depends(require_role(
 @router.get("/admin/list", response_model=DriverAdminListResponse)
 def list_drivers(
     verification_status: Optional[str] = Query(None),
+    wallet_state: Optional[str] = Query(
+        None,
+        description=(
+            "Filter alias: 'locked' maps to driver_profiles.is_suspended = true. "
+            "Approximation only -- is_suspended is set both by admin-initiated "
+            "suspension (reject_driver RPC, via /drivers/{id}/suspend) and by the "
+            "automatic block_driver_if_no_balance RPC when a driver's wallet balance "
+            "drops to zero or below. The two causes are not distinguished by any "
+            "column, so wallet_state=locked returns both kinds of suspension, not "
+            "wallet-balance lockouts specifically."
+        ),
+    ),
     limit: Optional[int] = Query(None, ge=1, le=1000, description="Page size; omit to return every match."),
     offset: int = Query(0, ge=0),
     _user=Depends(require_driver_document_access),
@@ -463,6 +475,10 @@ def list_drivers(
     one of the heaviest admin responses — paginate once the fleet outgrows one page.
     `total` always reports the full match count rather than the size of the page
     returned, so a caller can tell when it is looking at a partial list.
+
+    `wallet_state=locked` filters to `is_suspended = true`. This is an approximation:
+    is_suspended is also set by admin-initiated suspension (not exclusively a wallet
+    lock), and no column distinguishes the two causes today.
     """
     try:
         sb = get_supabase()
@@ -472,6 +488,8 @@ def list_drivers(
         )
         if verification_status:
             query = query.eq("verification_status", verification_status)
+        if wallet_state == "locked":
+            query = query.eq("is_suspended", True)
         query = query.order("created_at", desc=True)
         if limit is not None:
             query = query.range(offset, offset + limit - 1)

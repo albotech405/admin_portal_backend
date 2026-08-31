@@ -30,6 +30,8 @@ class TopupRequest(BaseModel):
 class TopupRequestsResponse(BaseModel):
     requests: List[TopupRequest]
     total: int
+    limit: Optional[int] = None
+    offset: int = 0
 
 
 class WalletTransaction(BaseModel):
@@ -51,6 +53,9 @@ class WalletBalanceResponse(BaseModel):
 
 class WalletTransactionListResponse(BaseModel):
     transactions: List[WalletTransaction]
+    total: int = 0
+    limit: Optional[int] = None
+    offset: int = 0
 
 
 class RejectBody(BaseModel):
@@ -60,16 +65,30 @@ class RejectBody(BaseModel):
 @router.get("/admin/topup/requests", response_model=TopupRequestsResponse)
 def list_topup_requests(
     status: Optional[str] = Query(None),
+    limit: Optional[int] = Query(None, ge=1, le=200, description="Page size; omit to return every match."),
+    offset: int = Query(0, ge=0),
     _user=Depends(require_admin),
 ):
     try:
         sb = get_supabase()
+
+        # Separate head=True count on wallet_topup_requests alone (no embed) --
+        # the data query below embeds driver_profiles/users, which an exact
+        # count doesn't need and would make more fragile/wasteful to include.
+        count_query = sb.table("wallet_topup_requests").select("id", count="exact", head=True)
+        if status:
+            count_query = count_query.eq("status", status)
+        total = count_query.execute().count or 0
+
         query = sb.table("wallet_topup_requests").select(
             "*, driver_profiles(user_id, users(full_name, phone_number))"
         )
         if status:
             query = query.eq("status", status)
-        result = query.order("submitted_at", desc=True).execute()
+        query = query.order("submitted_at", desc=True)
+        if limit is not None:
+            query = query.range(offset, offset + limit - 1)
+        result = query.execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -83,7 +102,7 @@ def list_topup_requests(
             phone_number=user_info.get("phone_number"),
         ))
 
-    return TopupRequestsResponse(requests=rows, total=len(rows))
+    return TopupRequestsResponse(requests=rows, total=total, limit=limit, offset=offset)
 
 
 @router.patch("/admin/topup/requests/{request_id}/approve")
@@ -147,18 +166,26 @@ def get_driver_balance(driver_id: str, _user=Depends(require_admin)):
 
 
 @router.get("/admin/driver/{driver_id}/transactions", response_model=WalletTransactionListResponse)
-def get_driver_transactions(driver_id: str, _user=Depends(require_admin)):
+def get_driver_transactions(
+    driver_id: str,
+    limit: Optional[int] = Query(None, ge=1, le=200, description="Page size; omit to return every match."),
+    offset: int = Query(0, ge=0),
+    _user=Depends(require_admin),
+):
     try:
         sb = get_supabase()
-        result = (
+        query = (
             sb.table("wallet_transactions")
-            .select("*")
+            .select("*", count="exact")
             .eq("driver_id", driver_id)
             .order("created_at", desc=True)
-            .execute()
         )
+        if limit is not None:
+            query = query.range(offset, offset + limit - 1)
+        result = query.execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+    total_matched = result.count if result.count is not None else len(result.data or [])
     transactions = [WalletTransaction(**t) for t in (result.data or [])]
-    return WalletTransactionListResponse(transactions=transactions)
+    return WalletTransactionListResponse(transactions=transactions, total=total_matched, limit=limit, offset=offset)

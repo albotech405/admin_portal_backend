@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional, Any, List
 from datetime import datetime, timezone
@@ -39,6 +39,8 @@ class DisputeItem(BaseModel):
 class DisputeListResponse(BaseModel):
     disputes: List[DisputeItem]
     total: int
+    limit: Optional[int] = None
+    offset: int = 0
 
 
 class DisputeActionBody(BaseModel):
@@ -54,13 +56,34 @@ class DisputeActionResponse(BaseModel):
 # ── Helpers ─────────────────────────────────────────────────────────────
 
 
-def _fetch_dispute_rides(sb, status_filter: Optional[str] = None) -> list:
+def _fetch_dispute_rides(
+    sb,
+    status_filter: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: int = 0,
+) -> tuple:
     """
     Fetch rides that have been flagged as disputed.
     Uses the `dispute_logs` table if it exists, otherwise falls back
     to rides with dispute info stored in their metadata.
+
+    Returns (items, total_matched). total_matched comes from a separate
+    head=True count query against dispute_logs alone (no rides/users/
+    driver_profiles embed) since the data query's 3-level embed makes an
+    exact count fragile/wasteful to compute inline.
     """
     now = datetime.now(timezone.utc)
+
+    # Count first (dispute_logs alone, no embed) -- if dispute_logs doesn't
+    # exist, both this and the data query below fail the same way, so treat
+    # a count failure as "no table" and return early with an empty result.
+    try:
+        count_query = sb.table("dispute_logs").select("id", count="exact", head=True)
+        if status_filter:
+            count_query = count_query.eq("status", status_filter)
+        total = count_query.execute().count or 0
+    except Exception:
+        return [], 0
 
     # Try dispute_logs table first
     try:
@@ -78,10 +101,12 @@ def _fetch_dispute_rides(sb, status_filter: Optional[str] = None) -> list:
         )
         if status_filter:
             query = query.eq("status", status_filter)
+        if limit is not None:
+            query = query.range(offset, offset + limit - 1)
         result = query.execute()
         logs = result.data or []
     except Exception:
-        logs = []
+        return [], 0
 
     if logs:
         items = []
@@ -120,10 +145,10 @@ def _fetch_dispute_rides(sb, status_filter: Optional[str] = None) -> list:
                     created_at=ride.get("created_at"),
                 )
             )
-        return items
+        return items, total
 
     # Fallback: no dispute_logs table — return empty
-    return []
+    return [], total
 
 
 def _get_dispute_parties(sb, ride_id: str) -> dict:
@@ -176,6 +201,8 @@ def _update_dispute_status(
 @router.get("/admin/disputes", response_model=DisputeListResponse)
 def list_disputes(
     status: Optional[str] = None,
+    limit: Optional[int] = Query(None, ge=1, le=200, description="Page size; omit to return every match."),
+    offset: int = Query(0, ge=0),
     _user=Depends(require_admin),
 ):
     """
@@ -184,8 +211,8 @@ def list_disputes(
     """
     try:
         sb = get_supabase()
-        items = _fetch_dispute_rides(sb, status_filter=status)
-        return DisputeListResponse(disputes=items, total=len(items))
+        items, total = _fetch_dispute_rides(sb, status_filter=status, limit=limit, offset=offset)
+        return DisputeListResponse(disputes=items, total=total, limit=limit, offset=offset)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -404,11 +431,16 @@ disputes_router = APIRouter(prefix="/disputes", tags=["disputes"])
 
 
 @disputes_router.get("/admin/list", response_model=DisputeListResponse, include_in_schema=False)
-def list_disputes_alt(status: Optional[str] = None, _user=Depends(require_admin)):
+def list_disputes_alt(
+    status: Optional[str] = None,
+    limit: Optional[int] = Query(None, ge=1, le=200, description="Page size; omit to return every match."),
+    offset: int = Query(0, ge=0),
+    _user=Depends(require_admin),
+):
     """Alias for /rides/admin/disputes."""
     try:
         sb = get_supabase()
-        items = _fetch_dispute_rides(sb, status_filter=status)
-        return DisputeListResponse(disputes=items, total=len(items))
+        items, total = _fetch_dispute_rides(sb, status_filter=status, limit=limit, offset=offset)
+        return DisputeListResponse(disputes=items, total=total, limit=limit, offset=offset)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

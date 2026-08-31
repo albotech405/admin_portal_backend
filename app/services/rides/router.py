@@ -35,7 +35,9 @@ class RideResponse(BaseModel):
     ride_request_id: Optional[str] = None
     customer_id: str
     driver_id: Optional[str] = None
+    customer_name: Optional[str] = None
     customer_phone: Optional[str] = None
+    driver_name: Optional[str] = None
     driver_phone: Optional[str] = None
     picking_point: Optional[Any] = None
     destination: Optional[Any] = None
@@ -47,21 +49,23 @@ class RideResponse(BaseModel):
     cancelled_at: Optional[str] = None
     cancelled_by: Optional[str] = None
     cancellation_reason: Optional[str] = None
+    distance_km: Optional[float] = None
+    category: Optional[str] = None
     created_at: str
 
 
 class RideDetailResponse(RideResponse):
-    customer_name: Optional[str] = None
+    # customer_name, driver_name, distance_km, category are inherited from
+    # RideResponse (added so the admin list stops showing bare UUIDs -- see
+    # _RIDE_FIELDS below, which is derived from RideResponse.model_fields and
+    # picks these up automatically). Not redeclared here to avoid a stale
+    # second definition drifting from the base class.
     customer_avatar_url: Optional[str] = None
-    driver_name: Optional[str] = None
-    driver_phone: Optional[str] = None
     driver_avatar_url: Optional[str] = None
-    distance_km: Optional[float] = None
     duration_minutes: Optional[float] = None
     platform_commission_amount: Optional[float] = None
     arrived_at: Optional[str] = None
     vehicle_snapshot: Optional[Any] = None
-    category: Optional[str] = None
     stops: Optional[Any] = None
     reason_code: Optional[str] = None
     reason_text: Optional[str] = None
