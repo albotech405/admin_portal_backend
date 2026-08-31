@@ -571,7 +571,7 @@ def get_heatmap(
     minutes: Optional[int] = Query(None, ge=1, le=43200, description="Sub-day/overriding time window in minutes (e.g. 15/30/60/180/1440/10080/43200). Overrides `days` when present."),
     source: str = Query("requests", description="Demand source: 'requests' (ride_requests) or 'rides' (historical)"),
     category: Optional[str] = Query(None, description="Filter: standard/premium/lady_driver"),
-    vehicle_type: Optional[str] = Query(None, description="Filter: car/moto/tuk_tuk/van/suv. Only applies to source='rides' and supply (driver_profiles) -- ride_requests has no vehicle_type column, so this filter is a no-op when source='requests'."),
+    vehicle_type: Optional[str] = Query(None, description="Filter: car/moto/tuk_tuk/van/suv. Only applies to source='requests' (ride_requests) and supply (driver_profiles) -- rides has no vehicle_type column (only category), so this filter is a no-op when source='rides'."),
     grid_size_deg: Optional[float] = Query(None, ge=0.001, le=0.5, description="Explicit grid cell size in degrees. Overrides zoom-derived size when given. Defaults to 0.01 (~1.1km) if grid_size_deg and zoom are both omitted."),
     zoom: Optional[int] = Query(None, ge=0, le=20, description="Map zoom level, mapped server-side to grid_size_deg when grid_size_deg is not explicitly given."),
     north: Optional[float] = Query(None, ge=-90, le=90, description="Viewport bbox north latitude bound. Must be given together with south/east/west."),
@@ -710,12 +710,12 @@ def get_heatmap(
         )
         if category:
             demand_query = demand_query.eq("category", category)
-        if vehicle_type and table_name == "rides":
-            # ride_requests has no vehicle_type column (confirmed absent --
-            # every other read of it off a ride_requests row is defensive,
-            # r.get("vehicle_type", "car"), unlike category which is filtered
-            # directly elsewhere in this codebase). Filtering by it there
-            # raises "column vehicle_type does not exist" (42703).
+        if vehicle_type and table_name == "ride_requests":
+            # Verified against the real production schema: rides has NO
+            # vehicle_type column (only category + vehicle_snapshot jsonb);
+            # ride_requests.vehicle_type is a real `character varying NOT NULL`
+            # column. Filtering rides by vehicle_type raises "column
+            # vehicle_type does not exist" (42703).
             demand_query = demand_query.eq("vehicle_type", vehicle_type)
         demand_rows = demand_query.execute().data or []
     except Exception:
