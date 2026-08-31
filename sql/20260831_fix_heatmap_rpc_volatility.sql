@@ -1,28 +1,22 @@
--- Admin Heatmap V3: per-cell cancellation count/rate and demand-trend metrics.
--- Run this AFTER sql/20260826_heatmap_v2_viewport_zoom.sql and sql/20260827_service_areas.sql.
+-- Fix: get_admin_heatmap was declared STABLE, but its body does
+-- `CREATE TEMPORARY TABLE ... ON COMMIT DROP` -- Postgres treats
+-- CREATE TABLE (even a session-scoped temp one) as a schema-modifying
+-- operation, which STABLE's "no database-visible side effects" contract
+-- forbids. This has been present since the very first version of this
+-- function (sql/20260825_heatmap_rpc.sql) and was carried forward unchanged
+-- through V2 and V3 -- surfaced in production as:
+--   {'message': 'CREATE TABLE is not allowed in a non-volatile function',
+--    'code': '0A000', ...}
 --
--- NOTE (2026-08-31): this function is declared VOLATILE, not STABLE. It was
--- originally declared STABLE in every version of this function going back to
--- sql/20260825_heatmap_rpc.sql, which is wrong -- the body does
--- CREATE TEMPORARY TABLE, and Postgres rejects DDL inside a STABLE function
--- ("CREATE TABLE is not allowed in a non-volatile function"). This file has
--- been corrected in place; the actual production fix, if this file was
--- already applied with STABLE, is sql/20260831_fix_heatmap_rpc_volatility.sql.
+-- Fix: mark the function VOLATILE (the correct classification for a function
+-- with side effects) instead of STABLE. The function body is otherwise
+-- byte-identical to sql/20260828_heatmap_v3_operational_intelligence.sql --
+-- this is a one-word fix (stable -> volatile), not a behavior change.
 --
 -- *** MANUAL APPLICATION REQUIRED ***
 -- AUTO_MIGRATE_ENABLED=false in production (Render cannot reach Supabase's
--- IPv6-only direct-connection hostname). This file will NOT be auto-applied
--- on deploy. Run manually in the Supabase SQL editor, like the three prior
--- post-incident migrations, until the Session Pooler/IPv6 fix is confirmed
--- and AUTO_MIGRATE_ENABLED is re-enabled.
---
--- Same signature as V2 -- strict no-op superset for every existing caller.
--- cancellation_count: ONLY when p_source = 'rides' (cancelled_at only exists
--- on rides) -- null (not 0) for source='requests'. prev_demand_count (for
--- trend): computed for BOTH sources (only needs created_at). Rate/trend-label
--- derivation happens in Python (_compute_cancellation_rate /
--- _compute_demand_trend), mirroring the existing _compute_imbalance pattern,
--- so that logic is unit-testable without a live database.
+-- IPv6-only direct-connection hostname). Run manually in the Supabase SQL
+-- editor.
 
 create or replace function public.get_admin_heatmap(
   p_admin_id uuid,
@@ -205,9 +199,5 @@ begin
   );
 end;
 $$;
-
-CREATE INDEX IF NOT EXISTS rides_cancelled_at_idx
-    ON public.rides (cancelled_at)
-    WHERE status = 'cancelled';
 
 notify pgrst, 'reload schema';
