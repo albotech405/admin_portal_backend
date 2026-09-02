@@ -46,17 +46,44 @@ class CustomerAdminListResponsePaginationTests(unittest.TestCase):
 
 
 class CustomerAdminItemBanRepresentationTests(unittest.TestCase):
-    def test_is_active_false_is_the_only_ban_field(self) -> None:
-        # Regression guard for BE-2: is_active is the sole ban representation.
-        # This just confirms the field exists and behaves as a plain bool --
-        # the absence of any is_banned/ban_reason/banned_at field is a
-        # structural fact about the model (no such field can be asserted
-        # "absent" meaningfully via a positive test; the audit that established
-        # this was a full-repo grep, not something this test re-derives).
+    def test_is_active_is_the_sole_ban_state(self) -> None:
+        # is_active alone determines banned/active status -- ban_reason/
+        # banned_at/banned_by (added below) are contextual metadata about a
+        # ban, not an alternate representation of ban state itself.
         item = _sample_item(is_active=False)
         self.assertFalse(item.is_active)
         item2 = _sample_item(is_active=True)
         self.assertTrue(item2.is_active)
+
+    def test_ban_context_fields_default_to_none(self) -> None:
+        item = _sample_item()
+        self.assertIsNone(item.ban_reason)
+        self.assertIsNone(item.banned_at)
+        self.assertIsNone(item.banned_by)
+        self.assertIsNone(item.banned_by_admin_name)
+
+    def test_ban_context_fields_accept_real_values(self) -> None:
+        item = _sample_item(
+            is_active=False,
+            ban_reason="Fraudulent activity",
+            banned_at="2026-09-01T12:00:00Z",
+            banned_by="admin-uuid-1",
+            banned_by_admin_name="Alice Admin",
+        )
+        self.assertFalse(item.is_active)
+        self.assertEqual(item.ban_reason, "Fraudulent activity")
+        self.assertEqual(item.banned_at, "2026-09-01T12:00:00Z")
+        self.assertEqual(item.banned_by, "admin-uuid-1")
+        self.assertEqual(item.banned_by_admin_name, "Alice Admin")
+
+    def test_unban_clears_ban_context_to_none(self) -> None:
+        # Mirrors unban_customer's behavior: is_active=true with all three
+        # context fields cleared back to null.
+        item = _sample_item(is_active=True, ban_reason=None, banned_at=None, banned_by=None)
+        self.assertTrue(item.is_active)
+        self.assertIsNone(item.ban_reason)
+        self.assertIsNone(item.banned_at)
+        self.assertIsNone(item.banned_by)
 
 
 if __name__ == "__main__":

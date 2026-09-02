@@ -1,39 +1,106 @@
+"""Admin dispute management.
+
+Full rewrite (not an extension) of the prior disputes module, which depended on
+a `dispute_logs` table that never existed in production (confirmed via a real
+production schema dump) and a `rides.dispute_status`/`rides.dispute_resolved_at`
+fallback that also never existed -- every dispute action could return HTTP 200
+"success" while writing nothing anywhere. The one exception was
+`charge_driver_dispute`, which moved real money via direct Python balance
+mutation with zero audit trail.
+
+This version is backed by real tables (`disputes`, `dispute_history`, see
+sql/20260901_disputes_tables.sql) and real atomic RPCs for financial actions
+(`dispute_refund_customer`, `dispute_charge_driver`, see
+sql/20260901_dispute_financial_rpcs.sql), mirroring the existing
+`approve_wallet_topup` pattern: assert_admin -> lock+validate -> mutate balance
+-> insert ledger row -> update the dispute row -> notify -> audit log, all in
+one Postgres transaction.
+
+Disputes are admin-created only for V1 -- no customer/driver-facing dispute
+infrastructure exists anywhere in this repo to build on.
+"""
+
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
-from typing import Optional, Any, List
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional, List
 from datetime import datetime, timezone
 from uuid import uuid4
-from app.core.dependencies import require_admin
-from app.core.supabase import get_supabase
-from app.services.notifications.router import send_push_to_users
 
-router = APIRouter(prefix="/rides", tags=["disputes"])
+from app.core.dependencies import require_admin, require_role
+from app.core.supabase import get_supabase, call_rpc, first_row, rpc_error_to_http_exception
+from app.services.audit.router import write_audit_log
+from app.services.disputes.transitions import is_valid_transition
+
+router = APIRouter(prefix="/disputes", tags=["disputes"])
+
 
 # ── Models ──────────────────────────────────────────────────────────────
 
 
-class DisputeItem(BaseModel):
-    ride_id: str
-    customer_id: str
-    customer_name: Optional[str] = None
-    customer_phone: Optional[str] = None
+class CreateDisputeBody(BaseModel):
+    filed_for: str  # "customer" | "driver"
+    customer_id: Optional[str] = None
     driver_id: Optional[str] = None
-    driver_name: Optional[str] = None
-    driver_phone: Optional[str] = None
-    picking_point: Optional[Any] = None
-    destination: Optional[Any] = None
-    price: float = 0.0
-    status: str
-    started_at: Optional[str] = None
-    completed_at: Optional[str] = None
-    dispute_reason: Optional[str] = None
-    dispute_raised_by: Optional[str] = None  # "customer" or "driver"
-    dispute_raised_at: Optional[str] = None
-    dispute_status: str = "open"  # open | refunded | driver_charged | dismissed | escalated
-    dispute_resolved_at: Optional[str] = None
-    dispute_resolved_by: Optional[str] = None
-    dispute_notes: Optional[str] = None
+    ride_id: Optional[str] = None
+    dispute_type: str
+    priority: str = "normal"
+    description: str
+    disputed_amount_cdf: Optional[float] = None
+    attachment_urls: List[str] = Field(default_factory=list)
+
+    @field_validator("filed_for")
+    @classmethod
+    def filed_for_valid(cls, v: str) -> str:
+        if v not in ("customer", "driver"):
+            raise ValueError("filed_for must be 'customer' or 'driver'")
+        return v
+
+
+class AssignDisputeBody(BaseModel):
+    assigned_to_admin_id: str
+    notes: Optional[str] = None
+
+
+class ResolveDisputeBody(BaseModel):
+    resolution_type: str  # "no_action" | "company_adjustment"
+    resolution_notes: Optional[str] = None
+
+
+class DismissEscalateReopenBody(BaseModel):
+    notes: Optional[str] = None
+
+
+class RefundDisputeBody(BaseModel):
+    amount_cdf: float = Field(..., gt=0)
+    notes: Optional[str] = None
+
+
+class ChargeDriverDisputeBody(BaseModel):
+    amount_cdf: float = Field(..., gt=0)
+    notes: Optional[str] = None
+
+
+class DisputeItem(BaseModel):
+    id: str
+    ride_id: Optional[str] = None
+    customer_id: Optional[str] = None
+    driver_id: Optional[str] = None
+    filed_by_admin_id: str
+    filed_for: str
+    dispute_type: str
+    priority: str = "normal"
+    status: str = "open"
+    assigned_to_admin_id: Optional[str] = None
+    description: str
+    attachment_urls: List[str] = Field(default_factory=list)
+    resolution_type: Optional[str] = None
+    resolution_notes: Optional[str] = None
+    resolved_by_admin_id: Optional[str] = None
+    resolved_at: Optional[str] = None
+    disputed_amount_cdf: Optional[float] = None
+    resolution_amount_cdf: Optional[float] = None
     created_at: str
+    updated_at: str
 
 
 class DisputeListResponse(BaseModel):
@@ -43,404 +110,355 @@ class DisputeListResponse(BaseModel):
     offset: int = 0
 
 
-class DisputeActionBody(BaseModel):
+class DisputeHistoryItem(BaseModel):
+    id: str
+    dispute_id: str
+    admin_id: Optional[str] = None
+    action: str
+    from_status: Optional[str] = None
+    to_status: Optional[str] = None
     notes: Optional[str] = None
+    metadata: Optional[dict] = None
+    created_at: str
 
 
-class DisputeActionResponse(BaseModel):
-    message: str
-    ride_id: str
-    dispute_status: str
+class DisputeDetailResponse(DisputeItem):
+    history: List[DisputeHistoryItem] = Field(default_factory=list)
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────
+_DISPUTE_FIELDS = set(DisputeItem.model_fields.keys())
 
 
-def _fetch_dispute_rides(
-    sb,
-    status_filter: Optional[str] = None,
-    limit: Optional[int] = None,
-    offset: int = 0,
-) -> tuple:
-    """
-    Fetch rides that have been flagged as disputed.
-    Uses the `dispute_logs` table if it exists, otherwise falls back
-    to rides with dispute info stored in their metadata.
+def _record_history(sb, *, dispute_id: str, admin_id: Optional[str], action: str,
+                     from_status: Optional[str] = None, to_status: Optional[str] = None,
+                     notes: Optional[str] = None, now_iso: Optional[str] = None) -> None:
+    sb.table("dispute_history").insert({
+        "id": str(uuid4()),
+        "dispute_id": dispute_id,
+        "admin_id": admin_id,
+        "action": action,
+        "from_status": from_status,
+        "to_status": to_status,
+        "notes": notes,
+        "created_at": now_iso or datetime.now(timezone.utc).isoformat(),
+    }).execute()
 
-    Returns (items, total_matched). total_matched comes from a separate
-    head=True count query against dispute_logs alone (no rides/users/
-    driver_profiles embed) since the data query's 3-level embed makes an
-    exact count fragile/wasteful to compute inline.
-    """
-    now = datetime.now(timezone.utc)
 
-    # Count first (dispute_logs alone, no embed) -- if dispute_logs doesn't
-    # exist, both this and the data query below fail the same way, so treat
-    # a count failure as "no table" and return early with an empty result.
+# ── Create / read ───────────────────────────────────────────────────────
+
+
+@router.post("/admin/create", status_code=201, response_model=DisputeItem)
+def create_dispute(body: CreateDisputeBody, _user=Depends(require_role("support", "finance", "operations"))):
+    """Admin-only intake: file a dispute on behalf of a customer or driver.
+    filed_by_admin_id (the acting admin) is always distinct from filed_for/
+    customer_id/driver_id (whose grievance this is)."""
+    if body.filed_for == "customer" and not body.customer_id:
+        raise HTTPException(status_code=400, detail="customer_id is required when filed_for='customer'")
+    if body.filed_for == "driver" and not body.driver_id:
+        raise HTTPException(status_code=400, detail="driver_id is required when filed_for='driver'")
+
+    sb = get_supabase()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    dispute_id = str(uuid4())
+    row = {
+        "id": dispute_id,
+        "ride_id": body.ride_id,
+        "customer_id": body.customer_id,
+        "driver_id": body.driver_id,
+        "filed_by_admin_id": _user.get("id"),
+        "filed_for": body.filed_for,
+        "dispute_type": body.dispute_type,
+        "priority": body.priority,
+        "status": "open",
+        "description": body.description,
+        "attachment_urls": body.attachment_urls,
+        "disputed_amount_cdf": body.disputed_amount_cdf,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
     try:
-        count_query = sb.table("dispute_logs").select("id", count="exact", head=True)
-        if status_filter:
-            count_query = count_query.eq("status", status_filter)
-        total = count_query.execute().count or 0
-    except Exception:
-        return [], 0
+        result = sb.table("disputes").insert(row).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not result.data:
+        raise HTTPException(status_code=500, detail="Dispute insert returned no row")
 
-    # Try dispute_logs table first
+    _record_history(sb, dispute_id=dispute_id, admin_id=_user.get("id"), action="created",
+                     to_status="open", now_iso=now_iso)
+
+    write_audit_log(
+        sb=sb, admin_user=_user, action_type="dispute_created", entity_type="disputes", entity_id=dispute_id,
+        summary=f"Admin filed dispute for {body.filed_for}", after_state=row,
+    )
+
+    created = result.data[0]
+    return DisputeItem(**{k: v for k, v in created.items() if k in _DISPUTE_FIELDS})
+
+
+@router.get("/admin/list", response_model=DisputeListResponse)
+def list_disputes(
+    status: Optional[str] = Query(None),
+    filed_for: Optional[str] = Query(None),
+    priority: Optional[str] = Query(None),
+    assigned_to_admin_id: Optional[str] = Query(None),
+    limit: Optional[int] = Query(None, ge=1, le=200, description="Page size; omit to return every match."),
+    offset: int = Query(0, ge=0),
+    _user=Depends(require_admin),
+):
+    sb = get_supabase()
     try:
-        query = (
-            sb.table("dispute_logs")
-            .select(
-                "*, "
-                "rides!inner("
-                "  *, "
-                "  users!rides_client_id_fkey(full_name, phone_number), "
-                "  driver_profiles!rides_driver_id_fkey(users!driver_profiles_user_id_fkey(full_name, phone_number))"
-                ")"
-            )
-            .order("created_at", desc=True)
-        )
-        if status_filter:
-            query = query.eq("status", status_filter)
+        query = sb.table("disputes").select("*", count="exact")
+        if status:
+            query = query.eq("status", status)
+        if filed_for:
+            query = query.eq("filed_for", filed_for)
+        if priority:
+            query = query.eq("priority", priority)
+        if assigned_to_admin_id:
+            query = query.eq("assigned_to_admin_id", assigned_to_admin_id)
+        query = query.order("created_at", desc=True).order("id")
         if limit is not None:
             query = query.range(offset, offset + limit - 1)
         result = query.execute()
-        logs = result.data or []
-    except Exception:
-        return [], 0
-
-    if logs:
-        items = []
-        for log in logs:
-            ride = log.pop("rides", {}) or {}
-            customer_info = ride.pop("users", {}) or {}
-            driver_profile = ride.pop("driver_profiles", None) or {}
-            driver_user_info = (
-                driver_profile.pop("users", {})
-                if isinstance(driver_profile, dict)
-                else {}
-            )
-
-            items.append(
-                DisputeItem(
-                    ride_id=ride.get("id"),
-                    customer_id=ride.get("customer_id"),
-                    customer_name=customer_info.get("full_name"),
-                    customer_phone=customer_info.get("phone_number"),
-                    driver_id=ride.get("driver_id"),
-                    driver_name=driver_user_info.get("full_name"),
-                    driver_phone=driver_user_info.get("phone_number"),
-                    picking_point=ride.get("picking_point"),
-                    destination=ride.get("destination"),
-                    price=float(ride.get("price", 0)),
-                    status=ride.get("status", "unknown"),
-                    started_at=ride.get("started_at"),
-                    completed_at=ride.get("completed_at"),
-                    dispute_reason=log.get("reason"),
-                    dispute_raised_by=log.get("raised_by"),
-                    dispute_raised_at=log.get("created_at"),
-                    dispute_status=log.get("status", "open"),
-                    dispute_resolved_at=log.get("resolved_at"),
-                    dispute_resolved_by=log.get("resolved_by"),
-                    dispute_notes=log.get("notes"),
-                    created_at=ride.get("created_at"),
-                )
-            )
-        return items, total
-
-    # Fallback: no dispute_logs table — return empty
-    return [], total
-
-
-def _get_dispute_parties(sb, ride_id: str) -> dict:
-    """Return customer_user_id and driver_user_id for a ride."""
-    try:
-        ride = sb.table("rides").select("customer_id, driver_id").eq("id", ride_id).maybe_single().execute()
-        if not ride.data:
-            return {}
-        driver_id = ride.data.get("driver_id")
-        driver_user_id = None
-        if driver_id:
-            dp = sb.table("driver_profiles").select("user_id").eq("id", driver_id).maybe_single().execute()
-            driver_user_id = (dp.data or {}).get("user_id")
-        return {
-            "customer_user_id": ride.data.get("customer_id"),
-            "driver_user_id": driver_user_id,
-        }
-    except Exception:
-        return {}
-
-
-def _update_dispute_status(
-    sb, ride_id: str, new_status: str, notes: Optional[str] = None, admin_id: Optional[str] = None
-):
-    """Update dispute status in dispute_logs table."""
-    now = datetime.now(timezone.utc).isoformat()
-    update_data = {
-        "status": new_status,
-        "resolved_at": now,
-        "resolved_by": admin_id,
-    }
-    if notes:
-        update_data["notes"] = notes
-
-    try:
-        sb.table("dispute_logs").update(update_data).eq("ride_id", ride_id).execute()
-    except Exception:
-        # If dispute_logs doesn't exist, try updating rides table
-        try:
-            sb.table("rides").update(
-                {"dispute_status": new_status, "dispute_resolved_at": now}
-            ).eq("id", ride_id).execute()
-        except Exception:
-            pass
-
-
-# ── Endpoints ────────────────────────────────────────────────────────────
-
-
-@router.get("/admin/disputes", response_model=DisputeListResponse)
-def list_disputes(
-    status: Optional[str] = None,
-    limit: Optional[int] = Query(None, ge=1, le=200, description="Page size; omit to return every match."),
-    offset: int = Query(0, ge=0),
-    _user=Depends(require_admin),
-):
-    """
-    List all disputed trips.
-    Optional filter by dispute status: open, refunded, driver_charged, dismissed, escalated.
-    """
-    try:
-        sb = get_supabase()
-        items, total = _fetch_dispute_rides(sb, status_filter=status, limit=limit, offset=offset)
-        return DisputeListResponse(disputes=items, total=total, limit=limit, offset=offset)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+    total_matched = result.count if result.count is not None else len(result.data or [])
+    items = [DisputeItem(**{k: v for k, v in row.items() if k in _DISPUTE_FIELDS}) for row in (result.data or [])]
+    return DisputeListResponse(disputes=items, total=total_matched, limit=limit, offset=offset)
 
-@router.patch("/admin/disputes/{ride_id}/refund", response_model=DisputeActionResponse)
-def refund_dispute(
-    ride_id: str,
-    body: DisputeActionBody = DisputeActionBody(),
-    _user=Depends(require_admin),
-):
-    """
-    Issue a full refund for a disputed trip.
-    Since payments are handled out-of-system, this records the refund action
-    and logs it for accounting. Admin should process the actual refund manually.
-    """
+
+@router.get("/admin/{dispute_id}", response_model=DisputeDetailResponse)
+def get_dispute_detail(dispute_id: str, _user=Depends(require_admin)):
+    sb = get_supabase()
     try:
-        sb = get_supabase()
-        admin_id = _user.get("id") or _user.get("user_id") or "unknown"
-
-        _update_dispute_status(sb, ride_id, "refunded", body.notes, admin_id)
-
-        # Log the refund action
-        try:
-            sb.table("dispute_logs").update({
-                "refund_amount": None,  # Admin enters manually
-                "refund_method": "manual",  # Out-of-system
-            }).eq("ride_id", ride_id).execute()
-        except Exception:
-            pass
-
-        # Push notification to customer
-        try:
-            parties = _get_dispute_parties(sb, ride_id)
-            if parties.get("customer_user_id"):
-                send_push_to_users(
-                    [parties["customer_user_id"]],
-                    "Dispute Resolved \u2013 Refund Issued",
-                    "Your dispute has been resolved and a refund has been issued. Please allow some time for processing.",
-                    notification_type="payment_update",
-                    persist=False,
-                )
-        except Exception:
-            pass
-
-        return DisputeActionResponse(
-            message="Dispute resolved: refund issued (manual processing required)",
-            ride_id=ride_id,
-            dispute_status="refunded",
-        )
+        current = sb.table("disputes").select("*").eq("id", dispute_id).maybe_single().execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    if not current.data:
+        raise HTTPException(status_code=404, detail="Dispute not found")
 
-
-@router.patch("/admin/disputes/{ride_id}/charge-driver", response_model=DisputeActionResponse)
-def charge_driver_dispute(
-    ride_id: str,
-    body: DisputeActionBody = DisputeActionBody(),
-    _user=Depends(require_admin),
-):
-    """
-    Charge a fee to the driver for a disputed trip.
-    This deducts from the driver's wallet credit_balance.
-    """
     try:
-        sb = get_supabase()
-        admin_id = _user.get("id") or _user.get("user_id") or "unknown"
-
-        # Get the ride to find the driver
-        ride = sb.table("rides").select("driver_id, price").eq("id", ride_id).maybe_single().execute()
-        if not ride.data:
-            raise HTTPException(status_code=404, detail="Ride not found")
-
-        driver_id = ride.data.get("driver_id")
-        if not driver_id:
-            raise HTTPException(status_code=400, detail="No driver assigned to this ride")
-
-        # Get driver's current balance
-        driver = (
-            sb.table("driver_profiles")
-            .select("id, credit_balance")
-            .eq("id", driver_id)
-            .maybe_single()
+        history_result = (
+            sb.table("dispute_history")
+            .select("*")
+            .eq("dispute_id", dispute_id)
+            .order("created_at", desc=True)
             .execute()
         )
-        if not driver.data:
-            raise HTTPException(status_code=404, detail="Driver profile not found")
+        history = [DisputeHistoryItem(**h) for h in (history_result.data or [])]
+    except Exception:
+        history = []
 
-        current_balance = driver.data.get("credit_balance") or 0
-        # Charge a fee (e.g., 5000 CDF as dispute fee, or the ride price)
-        fee_amount = float(ride.data.get("price", 0)) or 5000
-        new_balance = max(0, current_balance - fee_amount)
-
-        # Deduct from wallet
-        sb.table("driver_profiles").update({"credit_balance": new_balance}).eq(
-            "id", driver_id
-        ).execute()
-
-        # Log transaction
-        sb.table("wallet_transactions").insert({
-            "id": str(uuid4()),
-            "driver_id": driver_id,
-            "type": "debit",
-            "amount": fee_amount,
-            "balance_after": new_balance,
-            "reference_type": "dispute_fee",
-            "reference_id": ride_id,
-            "description": body.notes or "Dispute resolution fee charged",
-        }).execute()
-
-        _update_dispute_status(sb, ride_id, "driver_charged", body.notes, admin_id)
-
-        # Push notification to driver
-        try:
-            dp_user = sb.table("driver_profiles").select("user_id").eq("id", driver_id).maybe_single().execute()
-            if dp_user.data and dp_user.data.get("user_id"):
-                send_push_to_users(
-                    [dp_user.data["user_id"]],
-                    "Dispute Resolution \u2013 Charge Applied",
-                    f"{fee_amount} CDF has been deducted from your wallet as a dispute resolution charge.",
-                    notification_type="payment_update",
-                    persist=False,
-                )
-        except Exception:
-            pass
-
-        return DisputeActionResponse(
-            message=f"Driver charged {fee_amount} CDF for dispute resolution",
-            ride_id=ride_id,
-            dispute_status="driver_charged",
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    row_fields = {k: v for k, v in current.data.items() if k in _DISPUTE_FIELDS}
+    return DisputeDetailResponse(**row_fields, history=history)
 
 
-@router.patch("/admin/disputes/{ride_id}/dismiss", response_model=DisputeActionResponse)
-def dismiss_dispute(
-    ride_id: str,
-    body: DisputeActionBody = DisputeActionBody(),
-    _user=Depends(require_admin),
-):
-    """
-    Dismiss a dispute. No action taken, dispute is closed.
-    """
+# ── Non-financial status transitions ───────────────────────────────────
+
+
+def _fetch_dispute_or_404(sb, dispute_id: str) -> dict:
+    current = sb.table("disputes").select("*").eq("id", dispute_id).maybe_single().execute()
+    if not current.data:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    return current.data
+
+
+@router.patch("/admin/{dispute_id}/assign", response_model=DisputeItem)
+def assign_dispute(dispute_id: str, body: AssignDisputeBody,
+                    _user=Depends(require_role("support", "finance", "operations"))):
+    sb = get_supabase()
+    current = _fetch_dispute_or_404(sb, dispute_id)
+    from_status = current["status"]
+    to_status = "assigned"
+    if not is_valid_transition(from_status, to_status):
+        raise HTTPException(status_code=400, detail=f"Cannot assign a dispute in status '{from_status}'")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    sb.table("disputes").update({
+        "status": to_status, "assigned_to_admin_id": body.assigned_to_admin_id, "updated_at": now_iso,
+    }).eq("id", dispute_id).execute()
+    _record_history(sb, dispute_id=dispute_id, admin_id=_user.get("id"), action="assigned",
+                     from_status=from_status, to_status=to_status, notes=body.notes, now_iso=now_iso)
+    write_audit_log(sb=sb, admin_user=_user, action_type="dispute_assigned", entity_type="disputes",
+                     entity_id=dispute_id, summary=f"Admin assigned dispute to {body.assigned_to_admin_id}",
+                     before_state={"status": from_status},
+                     after_state={"status": to_status, "assigned_to_admin_id": body.assigned_to_admin_id})
+
+    updated = _fetch_dispute_or_404(sb, dispute_id)
+    return DisputeItem(**{k: v for k, v in updated.items() if k in _DISPUTE_FIELDS})
+
+
+@router.patch("/admin/{dispute_id}/escalate", response_model=DisputeItem)
+def escalate_dispute(dispute_id: str, body: DismissEscalateReopenBody = DismissEscalateReopenBody(),
+                      _user=Depends(require_role("support", "finance", "operations"))):
+    sb = get_supabase()
+    current = _fetch_dispute_or_404(sb, dispute_id)
+    from_status = current["status"]
+    to_status = "escalated"
+    if not is_valid_transition(from_status, to_status):
+        raise HTTPException(status_code=400, detail=f"Cannot escalate a dispute in status '{from_status}'")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    sb.table("disputes").update({"status": to_status, "updated_at": now_iso}).eq("id", dispute_id).execute()
+    _record_history(sb, dispute_id=dispute_id, admin_id=_user.get("id"), action="escalated",
+                     from_status=from_status, to_status=to_status, notes=body.notes, now_iso=now_iso)
+    write_audit_log(sb=sb, admin_user=_user, action_type="dispute_escalated", entity_type="disputes",
+                     entity_id=dispute_id, summary="Admin escalated dispute",
+                     before_state={"status": from_status}, after_state={"status": to_status})
+
+    updated = _fetch_dispute_or_404(sb, dispute_id)
+    return DisputeItem(**{k: v for k, v in updated.items() if k in _DISPUTE_FIELDS})
+
+
+@router.patch("/admin/{dispute_id}/dismiss", response_model=DisputeItem)
+def dismiss_dispute(dispute_id: str, body: DismissEscalateReopenBody = DismissEscalateReopenBody(),
+                     _user=Depends(require_role("support", "finance", "operations"))):
+    sb = get_supabase()
+    current = _fetch_dispute_or_404(sb, dispute_id)
+    from_status = current["status"]
+    to_status = "dismissed"
+    if not is_valid_transition(from_status, to_status):
+        raise HTTPException(status_code=400, detail=f"Cannot dismiss a dispute in status '{from_status}'")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    sb.table("disputes").update({
+        "status": to_status, "resolution_type": "dismissed", "resolution_notes": body.notes,
+        "resolved_by_admin_id": _user.get("id"), "resolved_at": now_iso, "updated_at": now_iso,
+    }).eq("id", dispute_id).execute()
+    _record_history(sb, dispute_id=dispute_id, admin_id=_user.get("id"), action="dismissed",
+                     from_status=from_status, to_status=to_status, notes=body.notes, now_iso=now_iso)
+    write_audit_log(sb=sb, admin_user=_user, action_type="dispute_dismissed", entity_type="disputes",
+                     entity_id=dispute_id, summary="Admin dismissed dispute",
+                     before_state={"status": from_status}, after_state={"status": to_status})
+
+    updated = _fetch_dispute_or_404(sb, dispute_id)
+    return DisputeItem(**{k: v for k, v in updated.items() if k in _DISPUTE_FIELDS})
+
+
+@router.patch("/admin/{dispute_id}/reopen", response_model=DisputeItem)
+def reopen_dispute(dispute_id: str, body: DismissEscalateReopenBody = DismissEscalateReopenBody(),
+                    _user=Depends(require_role("operations"))):
+    """Reopening a resolved/dismissed dispute overrides a prior admin's decision
+    -- gated at 'operations', above the tier that made routine resolutions."""
+    sb = get_supabase()
+    current = _fetch_dispute_or_404(sb, dispute_id)
+    from_status = current["status"]
+    to_status = "reopened"
+    if not is_valid_transition(from_status, to_status):
+        raise HTTPException(status_code=400, detail=f"Cannot reopen a dispute in status '{from_status}'")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    sb.table("disputes").update({"status": to_status, "updated_at": now_iso}).eq("id", dispute_id).execute()
+    _record_history(sb, dispute_id=dispute_id, admin_id=_user.get("id"), action="reopened",
+                     from_status=from_status, to_status=to_status, notes=body.notes, now_iso=now_iso)
+    write_audit_log(sb=sb, admin_user=_user, action_type="dispute_reopened", entity_type="disputes",
+                     entity_id=dispute_id, summary="Admin reopened dispute",
+                     before_state={"status": from_status}, after_state={"status": to_status})
+
+    updated = _fetch_dispute_or_404(sb, dispute_id)
+    return DisputeItem(**{k: v for k, v in updated.items() if k in _DISPUTE_FIELDS})
+
+
+@router.patch("/admin/{dispute_id}/resolve", response_model=DisputeItem)
+def resolve_dispute(dispute_id: str, body: ResolveDisputeBody,
+                     _user=Depends(require_role("support", "finance", "operations"))):
+    """Non-financial resolution only: 'no_action' or 'company_adjustment'.
+    company_adjustment (the company absorbs the cost, charges neither party)
+    additionally requires super_admin -- it's the one resolution with no
+    counterparty accountability check otherwise. No ledger row is written for
+    either resolution_type: no product-defined ledger semantic exists for
+    company_adjustment, and no_action never touches money by definition."""
+    if body.resolution_type not in ("no_action", "company_adjustment"):
+        raise HTTPException(status_code=400,
+                             detail="resolution_type must be 'no_action' or 'company_adjustment' for this endpoint "
+                                    "(use /refund or /charge-driver for financial resolutions)")
+    if body.resolution_type == "company_adjustment" and _user.get("admin_role") != "super_admin":
+        raise HTTPException(status_code=403, detail="company_adjustment resolution requires super_admin")
+
+    sb = get_supabase()
+    current = _fetch_dispute_or_404(sb, dispute_id)
+    from_status = current["status"]
+    to_status = "resolved"
+    if not is_valid_transition(from_status, to_status):
+        raise HTTPException(status_code=400, detail=f"Cannot resolve a dispute in status '{from_status}'")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    sb.table("disputes").update({
+        "status": to_status, "resolution_type": body.resolution_type, "resolution_notes": body.resolution_notes,
+        "resolved_by_admin_id": _user.get("id"), "resolved_at": now_iso, "updated_at": now_iso,
+    }).eq("id", dispute_id).execute()
+    _record_history(sb, dispute_id=dispute_id, admin_id=_user.get("id"), action=f"resolved_{body.resolution_type}",
+                     from_status=from_status, to_status=to_status, notes=body.resolution_notes, now_iso=now_iso)
+    write_audit_log(sb=sb, admin_user=_user, action_type="dispute_resolved", entity_type="disputes",
+                     entity_id=dispute_id, summary=f"Admin resolved dispute ({body.resolution_type})",
+                     before_state={"status": from_status},
+                     after_state={"status": to_status, "resolution_type": body.resolution_type})
+
+    updated = _fetch_dispute_or_404(sb, dispute_id)
+    return DisputeItem(**{k: v for k, v in updated.items() if k in _DISPUTE_FIELDS})
+
+
+# ── Financial resolutions (atomic RPCs) ────────────────────────────────
+
+
+@router.patch("/admin/{dispute_id}/refund")
+def refund_dispute(dispute_id: str, body: RefundDisputeBody, _user=Depends(require_role("finance", "operations"))):
+    """Atomic customer refund via the dispute_refund_customer RPC (see
+    sql/20260901_dispute_financial_rpcs.sql) -- mutates users.wallet_balance_cdf,
+    inserts a customer_wallet_transactions ledger row, updates the dispute's own
+    status/resolution fields, notifies the customer, and writes to admin_logs,
+    all in one Postgres transaction. Never mutates balances directly in Python.
+
+    Note: rpc_error_to_http_exception (app/core/supabase.py) only maps a few
+    specific admin/permission error substrings to 403/400 -- business-rule
+    errors raised by the RPC itself (dispute not found, wrong status, invalid
+    amount) fall through its generic 500 case. This matches the exact same
+    pre-existing characteristic of approve_wallet_topup's own business-rule
+    errors (e.g. "wallet top-up request is already approved") -- not a
+    regression introduced here, and not fixed here since that would change
+    shared, out-of-scope RPC-error-handling behavior."""
+    admin_id = _user.get("id")
+    if not admin_id:
+        raise HTTPException(status_code=400, detail="Admin token must include a user id")
     try:
-        sb = get_supabase()
-        admin_id = _user.get("id") or _user.get("user_id") or "unknown"
-        _update_dispute_status(sb, ride_id, "dismissed", body.notes, admin_id)
-
-        # Notify whichever party raised the dispute
-        try:
-            log = sb.table("dispute_logs").select("raised_by, ride_id").eq("ride_id", ride_id).maybe_single().execute()
-            parties = _get_dispute_parties(sb, ride_id)
-            raised_by = (log.data or {}).get("raised_by", "customer")
-            target_uid = parties.get("customer_user_id") if raised_by == "customer" else parties.get("driver_user_id")
-            if target_uid:
-                send_push_to_users(
-                    [target_uid], "Dispute Closed",
-                    "Your dispute has been reviewed and closed by the admin team.",
-                    notification_type="system", persist=False,
-                )
-        except Exception:
-            pass
-
-        return DisputeActionResponse(
-            message="Dispute dismissed",
-            ride_id=ride_id,
-            dispute_status="dismissed",
-        )
+        result = first_row(call_rpc("dispute_refund_customer", {
+            "p_admin_id": admin_id,
+            "p_dispute_id": dispute_id,
+            "p_amount_cdf": body.amount_cdf,
+            "p_notes": body.notes,
+        }))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise rpc_error_to_http_exception(e)
+    if not result:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    return result
 
 
-@router.patch("/admin/disputes/{ride_id}/escalate", response_model=DisputeActionResponse)
-def escalate_dispute(
-    ride_id: str,
-    body: DisputeActionBody = DisputeActionBody(),
-    _user=Depends(require_admin),
-):
-    """
-    Escalate a dispute to Super Admin for further review.
-    """
+@router.patch("/admin/{dispute_id}/charge-driver")
+def charge_driver_dispute(dispute_id: str, body: ChargeDriverDisputeBody,
+                           _user=Depends(require_role("finance", "operations"))):
+    """Atomic driver charge via the dispute_charge_driver RPC (see
+    sql/20260901_dispute_financial_rpcs.sql) -- mutates driver_profiles.
+    credit_balance, inserts a wallet_transactions ledger row, updates the
+    dispute's own status/resolution fields, notifies the driver, and writes to
+    admin_logs, all in one Postgres transaction. Rejects (raises) rather than
+    floors to zero when the charge exceeds the driver's balance -- the admin
+    must resolve the shortfall explicitly (partial charge, or a
+    company_adjustment resolve for the remainder) rather than silently
+    under-collecting."""
+    admin_id = _user.get("id")
+    if not admin_id:
+        raise HTTPException(status_code=400, detail="Admin token must include a user id")
     try:
-        sb = get_supabase()
-        admin_id = _user.get("id") or _user.get("user_id") or "unknown"
-        _update_dispute_status(sb, ride_id, "escalated", body.notes, admin_id)
-
-        # Notify whichever party raised the dispute
-        try:
-            log = sb.table("dispute_logs").select("raised_by").eq("ride_id", ride_id).maybe_single().execute()
-            parties = _get_dispute_parties(sb, ride_id)
-            raised_by = (log.data or {}).get("raised_by", "customer")
-            target_uid = parties.get("customer_user_id") if raised_by == "customer" else parties.get("driver_user_id")
-            if target_uid:
-                send_push_to_users(
-                    [target_uid], "Dispute Escalated",
-                    "Your dispute has been escalated for further review. We will follow up with you shortly.",
-                    notification_type="system", persist=False,
-                )
-        except Exception:
-            pass
-
-        return DisputeActionResponse(
-            message="Dispute escalated to Super Admin",
-            ride_id=ride_id,
-            dispute_status="escalated",
-        )
+        result = first_row(call_rpc("dispute_charge_driver", {
+            "p_admin_id": admin_id,
+            "p_dispute_id": dispute_id,
+            "p_amount_cdf": body.amount_cdf,
+            "p_notes": body.notes,
+        }))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ── Secondary router: /disputes prefix (alias for frontend convenience) ──
-
-disputes_router = APIRouter(prefix="/disputes", tags=["disputes"])
-
-
-@disputes_router.get("/admin/list", response_model=DisputeListResponse, include_in_schema=False)
-def list_disputes_alt(
-    status: Optional[str] = None,
-    limit: Optional[int] = Query(None, ge=1, le=200, description="Page size; omit to return every match."),
-    offset: int = Query(0, ge=0),
-    _user=Depends(require_admin),
-):
-    """Alias for /rides/admin/disputes."""
-    try:
-        sb = get_supabase()
-        items, total = _fetch_dispute_rides(sb, status_filter=status, limit=limit, offset=offset)
-        return DisputeListResponse(disputes=items, total=total, limit=limit, offset=offset)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise rpc_error_to_http_exception(e)
+    if not result:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    return result

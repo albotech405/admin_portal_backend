@@ -6,7 +6,7 @@ from typing import Optional, List, Any
 from datetime import datetime, timezone
 from uuid import uuid4
 from app.core.dependencies import require_admin, require_role
-from app.core.supabase import get_supabase
+from app.core.supabase import get_supabase, revoke_user_sessions
 from app.services.audit.router import write_audit_log
 
 router = APIRouter(prefix="/customers", tags=["customers"])
@@ -21,8 +21,10 @@ class CustomerAdminItem(BaseModel):
     is_active: bool = Field(
         ...,
         description="Canonical ban state: false means banned. There is no separate "
-        "ban_reason/banned_at/is_banned field anywhere in the schema -- is_active is "
-        "the sole representation of a customer's active/banned status.",
+        "is_banned field anywhere in the schema -- is_active is the sole "
+        "representation of a customer's active/banned status. ban_reason/banned_at/"
+        "banned_by are contextual metadata about the ban (who/why/when) and are NOT "
+        "an alternate ban representation.",
     )
     is_admin: bool = False
     gender: Optional[str] = None
@@ -35,6 +37,10 @@ class CustomerAdminItem(BaseModel):
     linked_driver_id: Optional[str] = None
     platform_roles: List[str] = Field(default_factory=lambda: ["customer"])
     linked_driver: Optional[dict] = None
+    ban_reason: Optional[str] = None
+    banned_at: Optional[str] = None
+    banned_by: Optional[str] = None
+    banned_by_admin_name: Optional[str] = None
 
 
 class CustomerAdminListResponse(BaseModel):
@@ -86,6 +92,7 @@ _CUSTOMER_FIELDS = {
     "id", "full_name", "phone_number", "email", "is_active", "is_admin",
     "gender", "profile_image_url", "customer_rating", "total_customer_ratings",
     "created_at", "updated_at", "privacy_preferences",
+    "ban_reason", "banned_at", "banned_by",
 }
 
 
@@ -110,6 +117,15 @@ def _build_driver_link_map(sb, user_ids: List[str]) -> dict[str, dict]:
         for row in (result.data or [])
         if row.get("user_id") and row.get("id")
     }
+
+
+def _build_banned_by_name_map(sb, admin_ids: List[str]) -> dict[str, str]:
+    """Batched lookup of banning-admin display names, mirroring
+    _build_driver_link_map's .in_() pattern -- avoids one query per row."""
+    if not admin_ids:
+        return {}
+    result = sb.table("users").select("id, full_name").in_("id", admin_ids).execute()
+    return {str(r["id"]): r.get("full_name") for r in (result.data or []) if r.get("id")}
 
 
 def _customer_identity_fields(driver_link: Optional[dict]) -> dict:
@@ -251,6 +267,8 @@ def list_customers(
     user_ids = [str(row.get("id")) for row in (result.data or []) if row.get("id")]
     try:
         driver_link_map = _build_driver_link_map(sb, user_ids)
+        banned_by_ids = list({row.get("banned_by") for row in (result.data or []) if row.get("banned_by")})
+        banned_by_name_map = _build_banned_by_name_map(sb, banned_by_ids)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -258,7 +276,8 @@ def list_customers(
     for r in result.data or []:
         row_fields = {k: v for k, v in r.items() if k in _CUSTOMER_FIELDS}
         identity_fields = _customer_identity_fields(driver_link_map.get(str(r.get("id"))))
-        customers.append(CustomerAdminItem(**row_fields, **identity_fields))
+        banned_by_admin_name = banned_by_name_map.get(str(r.get("banned_by"))) if r.get("banned_by") else None
+        customers.append(CustomerAdminItem(**row_fields, **identity_fields, banned_by_admin_name=banned_by_admin_name))
 
     return CustomerAdminListResponse(customers=customers, total=total_matched, limit=limit, offset=offset)
 
@@ -296,6 +315,10 @@ def get_customer_detail(user_id: str, _user=Depends(require_admin)):
     row_fields = {k: v for k, v in r.items() if k in _CUSTOMER_FIELDS}
     try:
         driver_link_map = _build_driver_link_map(sb, [user_id])
+        banned_by_admin_name = None
+        if r.get("banned_by"):
+            name_map = _build_banned_by_name_map(sb, [r["banned_by"]])
+            banned_by_admin_name = name_map.get(str(r["banned_by"]))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -303,24 +326,49 @@ def get_customer_detail(user_id: str, _user=Depends(require_admin)):
         **row_fields,
         total_rides=total_rides,
         total_spent=total_spent,
+        banned_by_admin_name=banned_by_admin_name,
         **_customer_identity_fields(driver_link_map.get(user_id)),
     )
 
 
 @router.patch("/admin/{user_id}/ban")
 def ban_customer(user_id: str, body: Optional[BanUnbanBody] = None, _user=Depends(require_admin)):
-    """Ban a customer by setting is_active=false -- this is the only ban
-    representation in the schema; there is no separate ban_reason/banned_at
-    column. `reason` (if given) is recorded only in the audit log, not persisted
-    on the users row."""
+    """Ban a customer by setting is_active=false -- the only boolean ban
+    representation in the schema; ban_reason/banned_at/banned_by persist WHO/WHY/
+    WHEN on the row for display, but ban STATE is always is_active alone. Also
+    force-logs-out the customer's active Supabase sessions."""
+    sb = get_supabase()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    reason = body.reason if body else None
+
     try:
-        sb = get_supabase()
-        result = sb.table("users").update({"is_active": False}).eq("id", user_id).execute()
+        existing = sb.table("users").select("supabase_uid, is_active").eq("id", user_id).maybe_single().execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Customer not found")
 
+    was_active = existing.data.get("is_active")
+    supabase_uid = existing.data.get("supabase_uid")
+
+    try:
+        result = sb.table("users").update({
+            "is_active": False,
+            "ban_reason": reason,
+            "banned_at": now_iso,
+            "banned_by": _user.get("id"),
+        }).eq("id", user_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     if not result.data:
         raise HTTPException(status_code=404, detail="Customer not found")
+
+    # Force logout: revoke_user_sessions never raises (it logs a warning and
+    # returns on failure -- see app/core/supabase.py). Only meaningful when
+    # supabase_uid exists; skips silently otherwise (a missing session
+    # revocation doesn't affect is_active's own enforcement).
+    if supabase_uid:
+        revoke_user_sessions(supabase_uid)
 
     write_audit_log(
         sb=sb,
@@ -328,21 +376,27 @@ def ban_customer(user_id: str, body: Optional[BanUnbanBody] = None, _user=Depend
         action_type="customer_banned",
         entity_type="users",
         entity_id=user_id,
-        summary=f"Admin banned customer{': ' + body.reason if body and body.reason else ''}",
-        before_state={"is_active": True},
-        after_state={"is_active": False, "reason": body.reason if body else None},
+        summary=f"Admin banned customer{': ' + reason if reason else ''}",
+        before_state={"is_active": was_active},
+        after_state={"is_active": False, "ban_reason": reason, "banned_at": now_iso, "banned_by": _user.get("id")},
     )
 
-    return {"message": "Customer banned", "reason": body.reason if body else None}
+    return {"message": "Customer banned", "reason": reason}
 
 
 @router.patch("/admin/{user_id}/unban")
 def unban_customer(user_id: str, _user=Depends(require_admin)):
-    """Unban a customer by setting is_active=true -- see ban_customer for the
+    """Unban a customer by setting is_active=true and clearing ban_reason/
+    banned_at/banned_by back to null -- see ban_customer for the
     canonical-ban-representation note."""
     try:
         sb = get_supabase()
-        result = sb.table("users").update({"is_active": True}).eq("id", user_id).execute()
+        result = sb.table("users").update({
+            "is_active": True,
+            "ban_reason": None,
+            "banned_at": None,
+            "banned_by": None,
+        }).eq("id", user_id).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -10,7 +10,7 @@ from app.services.wallet.router import router as wallet_router
 from app.services.customer_wallet.router import router as customer_wallet_router
 from app.services.drivers.router import router as drivers_router
 from app.services.rides.router import router as rides_router
-from app.services.disputes.router import router as disputes_router, disputes_router as disputes_alt_router
+from app.services.disputes.router import router as disputes_router
 from app.services.analytics.router import router as analytics_router
 from app.services.audit.router import router as audit_router
 from app.services.config.router import router as config_router
@@ -114,7 +114,6 @@ app.include_router(customer_wallet_router, prefix=settings.API_V1_PREFIX)
 app.include_router(drivers_router, prefix=settings.API_V1_PREFIX)
 app.include_router(rides_router, prefix=settings.API_V1_PREFIX)
 app.include_router(disputes_router, prefix=settings.API_V1_PREFIX)
-app.include_router(disputes_alt_router, prefix=settings.API_V1_PREFIX)
 app.include_router(analytics_router, prefix=settings.API_V1_PREFIX)
 app.include_router(audit_router, prefix=settings.API_V1_PREFIX)
 app.include_router(config_router, prefix=settings.API_V1_PREFIX)
