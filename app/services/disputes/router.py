@@ -18,6 +18,19 @@ one Postgres transaction.
 
 Disputes are admin-created only for V1 -- no customer/driver-facing dispute
 infrastructure exists anywhere in this repo to build on.
+
+Every non-financial status-changing endpoint (assign/escalate/dismiss/resolve/
+reopen) conditions its UPDATE on the status it read (`.eq("status", from_status)`)
+and treats a zero-row result as a 409, not just a Python-side is_valid_transition
+check followed by an unconditional UPDATE -- PostgREST issues each call as its
+own statement with no held lock across the read, so two concurrent requests
+reading the same from_status could otherwise both pass validation and the
+second UPDATE would silently overwrite the first (found and fixed during
+review; the same chained .eq().eq() pattern already exists in
+app/services/admin_mgmt/router.py). The financial actions (refund/
+charge-driver) don't need this -- they run inside dispute_refund_customer/
+dispute_charge_driver, which take `FOR UPDATE` row locks inside one Postgres
+transaction instead.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -275,9 +288,12 @@ def assign_dispute(dispute_id: str, body: AssignDisputeBody,
         raise HTTPException(status_code=400, detail=f"Cannot assign a dispute in status '{from_status}'")
 
     now_iso = datetime.now(timezone.utc).isoformat()
-    sb.table("disputes").update({
+    updated_rows = sb.table("disputes").update({
         "status": to_status, "assigned_to_admin_id": body.assigned_to_admin_id, "updated_at": now_iso,
-    }).eq("id", dispute_id).execute()
+    }).eq("id", dispute_id).eq("status", from_status).execute()
+    if not updated_rows.data:
+        raise HTTPException(status_code=409,
+                             detail="Dispute status changed concurrently; refetch and retry")
     _record_history(sb, dispute_id=dispute_id, admin_id=_user.get("id"), action="assigned",
                      from_status=from_status, to_status=to_status, notes=body.notes, now_iso=now_iso)
     write_audit_log(sb=sb, admin_user=_user, action_type="dispute_assigned", entity_type="disputes",
@@ -300,7 +316,12 @@ def escalate_dispute(dispute_id: str, body: DismissEscalateReopenBody = DismissE
         raise HTTPException(status_code=400, detail=f"Cannot escalate a dispute in status '{from_status}'")
 
     now_iso = datetime.now(timezone.utc).isoformat()
-    sb.table("disputes").update({"status": to_status, "updated_at": now_iso}).eq("id", dispute_id).execute()
+    updated_rows = sb.table("disputes").update(
+        {"status": to_status, "updated_at": now_iso}
+    ).eq("id", dispute_id).eq("status", from_status).execute()
+    if not updated_rows.data:
+        raise HTTPException(status_code=409,
+                             detail="Dispute status changed concurrently; refetch and retry")
     _record_history(sb, dispute_id=dispute_id, admin_id=_user.get("id"), action="escalated",
                      from_status=from_status, to_status=to_status, notes=body.notes, now_iso=now_iso)
     write_audit_log(sb=sb, admin_user=_user, action_type="dispute_escalated", entity_type="disputes",
@@ -322,10 +343,13 @@ def dismiss_dispute(dispute_id: str, body: DismissEscalateReopenBody = DismissEs
         raise HTTPException(status_code=400, detail=f"Cannot dismiss a dispute in status '{from_status}'")
 
     now_iso = datetime.now(timezone.utc).isoformat()
-    sb.table("disputes").update({
+    updated_rows = sb.table("disputes").update({
         "status": to_status, "resolution_type": "dismissed", "resolution_notes": body.notes,
         "resolved_by_admin_id": _user.get("id"), "resolved_at": now_iso, "updated_at": now_iso,
-    }).eq("id", dispute_id).execute()
+    }).eq("id", dispute_id).eq("status", from_status).execute()
+    if not updated_rows.data:
+        raise HTTPException(status_code=409,
+                             detail="Dispute status changed concurrently; refetch and retry")
     _record_history(sb, dispute_id=dispute_id, admin_id=_user.get("id"), action="dismissed",
                      from_status=from_status, to_status=to_status, notes=body.notes, now_iso=now_iso)
     write_audit_log(sb=sb, admin_user=_user, action_type="dispute_dismissed", entity_type="disputes",
@@ -349,7 +373,12 @@ def reopen_dispute(dispute_id: str, body: DismissEscalateReopenBody = DismissEsc
         raise HTTPException(status_code=400, detail=f"Cannot reopen a dispute in status '{from_status}'")
 
     now_iso = datetime.now(timezone.utc).isoformat()
-    sb.table("disputes").update({"status": to_status, "updated_at": now_iso}).eq("id", dispute_id).execute()
+    updated_rows = sb.table("disputes").update(
+        {"status": to_status, "updated_at": now_iso}
+    ).eq("id", dispute_id).eq("status", from_status).execute()
+    if not updated_rows.data:
+        raise HTTPException(status_code=409,
+                             detail="Dispute status changed concurrently; refetch and retry")
     _record_history(sb, dispute_id=dispute_id, admin_id=_user.get("id"), action="reopened",
                      from_status=from_status, to_status=to_status, notes=body.notes, now_iso=now_iso)
     write_audit_log(sb=sb, admin_user=_user, action_type="dispute_reopened", entity_type="disputes",
@@ -384,10 +413,13 @@ def resolve_dispute(dispute_id: str, body: ResolveDisputeBody,
         raise HTTPException(status_code=400, detail=f"Cannot resolve a dispute in status '{from_status}'")
 
     now_iso = datetime.now(timezone.utc).isoformat()
-    sb.table("disputes").update({
+    updated_rows = sb.table("disputes").update({
         "status": to_status, "resolution_type": body.resolution_type, "resolution_notes": body.resolution_notes,
         "resolved_by_admin_id": _user.get("id"), "resolved_at": now_iso, "updated_at": now_iso,
-    }).eq("id", dispute_id).execute()
+    }).eq("id", dispute_id).eq("status", from_status).execute()
+    if not updated_rows.data:
+        raise HTTPException(status_code=409,
+                             detail="Dispute status changed concurrently; refetch and retry")
     _record_history(sb, dispute_id=dispute_id, admin_id=_user.get("id"), action=f"resolved_{body.resolution_type}",
                      from_status=from_status, to_status=to_status, notes=body.resolution_notes, now_iso=now_iso)
     write_audit_log(sb=sb, admin_user=_user, action_type="dispute_resolved", entity_type="disputes",
